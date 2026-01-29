@@ -3,6 +3,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
+def get_threshold():
+    return 1.5
+def get_fps():
+    return 30
+def get_controll_time():
+    return 0.2
 
 def load_pt(path: Path):
     return torch.load(path, map_location="cpu")
@@ -38,9 +44,13 @@ def extract_transl(obj):
 
 def plot_transl(transl: np.ndarray, title: str):
     # transl: (T,3)
+    y_smooth = smooth_1d(transl[:, 1], window=11)
+    y_peaks = find_peaks_1d(y_smooth)
     plt.figure()
-    plt.plot(transl[:, 0], label="x")
-    plt.plot(transl[:, 1], label="y")
+    plt.plot(transl[:, 0], label="z")
+    plt.plot(y_smooth, label="y (smooth)")
+    if y_peaks.size >= 1:
+        plt.scatter(y_peaks, y_smooth[y_peaks], color="red", s=20, zorder=3, label="y peaks")
     plt.plot(transl[:, 2], label="z")
     plt.xlabel("Frame")
     plt.ylabel("Translation")
@@ -49,8 +59,28 @@ def plot_transl(transl: np.ndarray, title: str):
     plt.tight_layout()
     plt.show()
 
-def smooth():
-    
+
+def smooth_1d(x: np.ndarray, window: int = 11) -> np.ndarray:
+    if window <= 1:
+        return x
+    if window % 2 == 0:
+        window += 1
+    pad = window // 2
+    x_pad = np.pad(x, (pad, pad), mode="edge")
+    kernel = np.ones(window, dtype=float) / float(window)
+    return np.convolve(x_pad, kernel, mode="valid")
+
+
+def find_peaks_1d(x: np.ndarray) -> np.ndarray:
+    # Lokale Maxima: x[i-1] < x[i] >= x[i+1]
+    if x.size < 3:
+        return np.array([], dtype=int)
+    prev = x[:-2]
+    curr = x[1:-1]
+    nxt = x[2:]
+    n = int(get_controll_time() * get_fps())
+
+    return np.where((curr > prev) & (curr >= nxt))[0] + 1
 
 
 def main():

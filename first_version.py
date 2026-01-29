@@ -38,9 +38,8 @@ def extract_transl(obj):
 
 def plot_transl(transl: np.ndarray, title: str):
     # transl: (T,3)
-    x_smooth = smooth_1d(transl[:, 0], window=11)
     plt.figure()
-    plt.plot(x_smooth, label="x (smooth)")
+    plt.plot(transl[:, 0], label="x")
     plt.plot(transl[:, 1], label="y")
     plt.plot(transl[:, 2], label="z")
     plt.xlabel("Frame")
@@ -50,16 +49,8 @@ def plot_transl(transl: np.ndarray, title: str):
     plt.tight_layout()
     plt.show()
 
-
-def smooth_1d(x: np.ndarray, window: int = 11) -> np.ndarray:
-    if window <= 1:
-        return x
-    if window % 2 == 0:
-        window += 1
-    pad = window // 2
-    x_pad = np.pad(x, (pad, pad), mode="edge")
-    kernel = np.ones(window, dtype=float) / float(window)
-    return np.convolve(x_pad, kernel, mode="valid")
+def smooth():
+    
 
 
 def main():

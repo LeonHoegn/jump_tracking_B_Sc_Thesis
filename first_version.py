@@ -93,7 +93,6 @@ def find_peaks_1d(x: np.ndarray) -> np.ndarray:
     for i, hp in enumerate(high_points):
         th = get_threshold()
         diff = x[hp] - x[low_points[i]]
-        print(f"{i}: {diff};") 
         if diff >= th:
             high_points_over_th.append(hp)
 

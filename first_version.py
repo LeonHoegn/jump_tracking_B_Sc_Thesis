@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 def get_threshold():
-    return 1.5
+    return 0.2
 def get_fps():
     return 30
 def get_controll_time():
@@ -45,6 +45,7 @@ def extract_transl(obj):
 def plot_transl(transl: np.ndarray, title: str):
     # transl: (T,3)
     y_smooth = smooth_1d(transl[:, 1], window=11)
+ #   y_smooth = transl[:, 1]    # with smooth little better results
     y_peaks = find_peaks_1d(y_smooth)
     plt.figure()
     plt.plot(transl[:, 0], label="z")
@@ -80,7 +81,23 @@ def find_peaks_1d(x: np.ndarray) -> np.ndarray:
     nxt = x[2:]
     n = int(get_controll_time() * get_fps())
 
-    return np.where((curr > prev) & (curr >= nxt))[0] + 1
+    high_points = np.where((curr > prev) & (curr >= nxt))[0] + 1
+
+    low_points = np.where((curr < prev) & (curr <= nxt))[0] + 1
+
+    if x[0] < x[1]:
+        low_points = np.insert(low_points, 0, x[0])
+
+    high_points_over_th = []
+
+    for i, hp in enumerate(high_points):
+        th = get_threshold()
+        diff = x[hp] - x[low_points[i]]
+        print(f"{i}: {diff};") 
+        if diff >= th:
+            high_points_over_th.append(hp)
+
+    return np.array(high_points_over_th, dtype=int)
 
 
 def main():

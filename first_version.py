@@ -42,11 +42,7 @@ def extract_transl(obj):
     raise KeyError("Konnte keine transl (T,3) finden. Bitte Key-Pfad nennen.")
 
 
-def plot_transl(transl: np.ndarray, title: str):
-    # transl: (T,3)
-    y_smooth = smooth_1d(transl[:, 1], window=11)
- #   y_smooth = transl[:, 1]    # with smooth little better results
-    y_peaks = find_peaks_1d(y_smooth)
+def plot_transl(transl: np.ndarray, y_smooth: np.ndarray, y_peaks: np.ndarray, title: str):
     plt.figure()
     plt.plot(transl[:, 0], label="z")
     plt.plot(y_smooth, label="y (smooth)")
@@ -106,7 +102,9 @@ def main():
     for pt_file in sorted(folder.rglob("*hmr4d_results.pt")):
         data = load_pt(pt_file)
         transl = extract_transl(data)
-        plot_transl(transl, title=pt_file.name)
+        y_smooth = smooth_1d(transl[:, 1], window=11)
+        y_peaks = find_peaks_1d(y_smooth)
+        plot_transl(transl, y_smooth, y_peaks, title=pt_file.name)
 
 
 if __name__ == "__main__":

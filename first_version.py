@@ -42,7 +42,13 @@ def extract_transl(obj):
     raise KeyError("Konnte keine transl (T,3) finden. Bitte Key-Pfad nennen.")
 
 
-def plot_transl(transl: np.ndarray, y_smooth: np.ndarray, y_peaks: np.ndarray, title: str):
+def plot_transl(
+    transl: np.ndarray,
+    y_smooth: np.ndarray,
+    y_peaks: np.ndarray,
+    title: str,
+    save_path: Path | None = None,
+):
     plt.figure()
     plt.plot(transl[:, 0], label="z")
     plt.plot(y_smooth, label="y (smooth)")
@@ -54,6 +60,11 @@ def plot_transl(transl: np.ndarray, y_smooth: np.ndarray, y_peaks: np.ndarray, t
     plt.title(title)
     plt.legend()
     plt.tight_layout()
+    if save_path is not None:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(save_path, dpi=150)
+        plt.close()
+        return
     plt.show()
 
 
@@ -99,12 +110,16 @@ def find_peaks_1d(x: np.ndarray) -> np.ndarray:
 
 def main():
     folder = Path("inputs")
+    out_root = Path("outputs")
     for pt_file in sorted(folder.rglob("*hmr4d_results.pt")):
         data = load_pt(pt_file)
         transl = extract_transl(data)
         y_smooth = smooth_1d(transl[:, 1], window=11)
         y_peaks = find_peaks_1d(y_smooth)
-        plot_transl(transl, y_smooth, y_peaks, title=pt_file.name)
+        rel_dir = pt_file.parent.relative_to(folder)
+        out_dir = out_root / rel_dir
+        out_file = out_dir / f"{pt_file.stem}.png"
+        plot_transl(transl, y_smooth, y_peaks, title=pt_file.name, save_path=out_file)
 
 
 if __name__ == "__main__":

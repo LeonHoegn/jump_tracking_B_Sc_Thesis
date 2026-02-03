@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 def get_threshold():
-    return 0.1
+    return 0.2
 def get_fps():
     return 30
 def get_controll_time():

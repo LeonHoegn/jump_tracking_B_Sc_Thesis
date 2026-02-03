@@ -176,6 +176,7 @@ def find_peaks_1d(x: np.ndarray) -> np.ndarray:
         low_points = np.insert(low_points, 0, x[0])
 
     high_points_over_th = []
+    between_low_points = []
 
     x_mean = np.mean(x)
 
@@ -184,8 +185,10 @@ def find_peaks_1d(x: np.ndarray) -> np.ndarray:
         diff = x[hp] - x[low_points[i]]
         if (diff >= th) and (x_mean < x[hp] + (0.8 * th)):
             high_points_over_th.append(hp)
+            between_low_points.append(low_points[i])
+            between_low_points.append(low_points[i+1])
 
-    return np.array(high_points_over_th, dtype=int)
+    return np.array(high_points_over_th, dtype=int), np.array(between_low_points, dtype=int)
 
 
 def main():
@@ -199,7 +202,7 @@ def main():
             hmr, bbx, video_path = load_data(pt_file)
             transl = extract_transl(hmr)
             y_smooth = smooth_1d(transl[:, 1], window=11)
-            y_peaks = find_peaks_1d(y_smooth)
+            y_peaks, y_between = find_peaks_1d(y_smooth)
             rel_dir = base_dir.relative_to(folder)
             out_dir = out_root / rel_dir
             plot_file = out_dir / f"{pt_file.stem}.png"

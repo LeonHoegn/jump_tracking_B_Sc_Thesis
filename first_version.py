@@ -103,7 +103,7 @@ def find_peaks_1d(x: np.ndarray) -> np.ndarray:
 
 def main():
     folder = Path("inputs")
-    for pt_file in sorted(folder.glob("*.pt")):
+    for pt_file in sorted(folder.rglob("*hmr4d_results.pt")):
         data = load_pt(pt_file)
         transl = extract_transl(data)
         plot_transl(transl, title=pt_file.name)

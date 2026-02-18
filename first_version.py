@@ -22,9 +22,9 @@ def find_first(path: Path, pattern: str) -> Path:
     return matches[0]
 
 
-def load_data(pt_file: Path):
-    base_dir = pt_file.parent
-    data = load_pt(pt_file)
+def load_data(input_file: Path):
+    base_dir = input_file.parent
+    data = load_pt(input_file)
     bbx_path = find_first(base_dir, "bbx.pt")
     bbx = load_pt(bbx_path)
     video_path = find_first(base_dir, "0_input_video.mp4")
@@ -194,20 +194,22 @@ def find_peaks_1d(x: np.ndarray) -> np.ndarray:
 def main():
     folder = Path("inputs")
     out_root = Path("outputs")
-    for pt_file in sorted(folder.rglob("*hmr4d_results.pt")):
-        base_dir = pt_file.parent
+    input_files = sorted(folder.rglob("*hmr4d_results.pt")) + sorted(folder.rglob("*.smpl"))
+    print(f"{len(input_files)} files loaded")
+    for input_file in sorted(input_files):
+        base_dir = input_file.parent
         has_bbx = any(base_dir.rglob("bbx.pt"))
         has_video = any(base_dir.rglob("0_input_video.mp4"))
         if has_bbx and has_video:
-            hmr, bbx, video_path = load_data(pt_file)
+            hmr, bbx, video_path = load_data(input_file)
             transl = extract_transl(hmr)
             y_smooth = smooth_1d(transl[:, 1], window=11)
             y_peaks, y_between = find_peaks_1d(y_smooth)
             rel_dir = base_dir.relative_to(folder)
             out_dir = out_root / rel_dir
-            plot_file = out_dir / f"{pt_file.stem}.png"
-            video_file = out_dir / f"{pt_file.stem}.mp4"
-            plot_transl(transl, y_smooth, y_peaks, title=pt_file.name, save_path=plot_file)
+            plot_file = out_dir / f"{input_file.stem}.png"
+            video_file = out_dir / f"{input_file.stem}.mp4"
+            plot_transl(transl, y_smooth, y_peaks, title=input_file.name, save_path=plot_file)
             add_bbx(video_path, bbx, video_file)
 
 

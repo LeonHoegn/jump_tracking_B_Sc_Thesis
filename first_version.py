@@ -283,7 +283,7 @@ def add_bbx(
                 subject_text_y = max(20, y1 - 10)
                 cv2.putText(
                     frame,
-                    f"Subject: {box_idx}",
+                    f"subject-{box_idx + 1}",
                     (x1, subject_text_y),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,

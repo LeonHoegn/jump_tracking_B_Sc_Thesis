@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import cv2
 import pickle
 from pathlib import Path
+import tyro
 
 def get_threshold():
     return 0.2
@@ -279,8 +280,19 @@ def add_bbx(
                 ref_w, ref_h = bbx_ref_size if bbx_ref_size is not None else (None, None)
                 x1, y1, x2, y2 = box_to_xyxy(frame_boxes[box_idx], w, h, ref_w, ref_h)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                subject_text_y = max(20, y1 - 10)
+                cv2.putText(
+                    frame,
+                    f"Subject: {box_idx}",
+                    (x1, subject_text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    color,
+                    2,
+                    cv2.LINE_AA,
+                )
                 if jump:
-                    text_y = max(0, y1 - 10)
+                    text_y = min(h - 10, y1 + 25)
                     cv2.putText(
                         frame,
                         "jumping",
@@ -404,8 +416,13 @@ def find_peaks_1d(x: np.ndarray) -> np.ndarray:
     return np.array(high_points_over_th, dtype=int), np.array(between_low_points, dtype=int)
 
 
-def main():
-    folder = Path("inputs")
+def main(input_video: str = ""):
+    inputs_root = Path("inputs")
+    folder = inputs_root if input_video == "" else inputs_root / input_video
+    if not folder.exists():
+        raise FileNotFoundError(f"Eingabeordner nicht gefunden: {folder}")
+    if not folder.is_dir():
+        raise NotADirectoryError(f"Eingabepfad ist kein Ordner: {folder}")
     out_root = Path("outputs")
     input_files = sorted(folder.rglob("*hmr4d_results.pt")) + sorted(folder.rglob("*.smpl"))
     print(f"{len(input_files)} files loaded")
@@ -424,6 +441,7 @@ def main():
             video_file = out_dir / f"{input_file.stem}.mp4"
             plot_transl(transl, y_smooth, y_peaks, title=input_file.name, save_path=plot_file)
             add_bbx(video_path, bbx, video_file, y_between)
+            print("finished ", base_dir)
         elif has_bbx:
             print("no video in ", base_dir)
         else:
@@ -431,4 +449,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    tyro.cli(main())

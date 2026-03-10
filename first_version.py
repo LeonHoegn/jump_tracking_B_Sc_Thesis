@@ -76,7 +76,10 @@ def load_data(input_file: Path):
                 f"Keine Bounding-Box Quelle gefunden in {base_dir} (erwartet: bbx.pt oder results.pkl)"
             )
         bbx = load_pkl(results_path)
-    video_path = find_first(base_dir, "0_input_video.mp4")
+    if (any(base_dir.rglob("0_input_video.mp4"))):
+        video_path = find_first(base_dir, "0_input_video.mp4")
+    else:
+        video_path = find_first(base_dir, "*.mp4")
     return data, bbx, video_path
 
 
@@ -366,7 +369,7 @@ def main():
     for input_file in sorted(input_files):
         base_dir = input_file.parent
         has_bbx = any(base_dir.rglob("bbx.pt")) or any(base_dir.rglob("results.pkl"))
-        has_video = any(base_dir.rglob("0_input_video.mp4"))
+        has_video = any(base_dir.rglob("*.mp4"))
         if has_bbx and has_video:
             hmr, bbx, video_path = load_data(input_file)
             transl = extract_transl(hmr)
@@ -379,9 +382,9 @@ def main():
             plot_transl(transl, y_smooth, y_peaks, title=input_file.name, save_path=plot_file)
             add_bbx(video_path, bbx, video_file, y_between)
         elif has_bbx:
-            print("no video")
+            print("no video in ", base_dir)
         else:
-            print("bo bbx")
+            print("no bbx in ", base_dir)
 
 
 if __name__ == "__main__":

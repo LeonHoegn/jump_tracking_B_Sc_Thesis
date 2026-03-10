@@ -183,13 +183,52 @@ def extract_bbx_frames(obj) -> list[np.ndarray]:
     raise TypeError("Unbekanntes bbx-Format.")
 
 
-def box_to_xyxy(box: np.ndarray, w: int, h: int) -> tuple[int, int, int, int]:
-    x1, y1, x2, y2 = box.astype(float)
+def extract_bbx_reference_size(obj) -> tuple[int, int] | None:
+    if not isinstance(obj, dict):
+        return None
+    camera = obj.get("camera")
+    if not isinstance(camera, dict):
+        return None
+    img_center = camera.get("img_center")
+    if img_center is None:
+        return None
+    center = _as_numpy(img_center).reshape(-1)
+    if center.size < 2:
+        return None
+    ref_w = int(round(float(center[0]) * 2.0))
+    ref_h = int(round(float(center[1]) * 2.0))
+    if ref_w <= 0 or ref_h <= 0:
+        return None
+    return ref_w, ref_h
+
+
+def box_to_xyxy(
+    box: np.ndarray,
+    w: int,
+    h: int,
+    ref_w: int | None = None,
+    ref_h: int | None = None,
+) -> tuple[int, int, int, int]:
+    box = box.astype(float)
+    if box.shape == (2, 2):
+        x1, y1 = box[0]
+        x2, y2 = box[1]
+    elif box.shape == (4,):
+        x1, y1, x2, y2 = box
+    else:
+        raise ValueError(f"Unerwartete Box-Form fuer xyxy-Konvertierung: {box.shape}")
     if 0.0 <= x2 <= 1.5 and 0.0 <= y2 <= 1.5 and 0.0 <= x1 <= 1.5 and 0.0 <= y1 <= 1.5:
         x1 *= w
         x2 *= w
         y1 *= h
         y2 *= h
+    elif ref_w is not None and ref_h is not None and (ref_w != w or ref_h != h):
+        scale_x = w / float(ref_w)
+        scale_y = h / float(ref_h)
+        x1 *= scale_x
+        x2 *= scale_x
+        y1 *= scale_y
+        y2 *= scale_y
     if x2 <= x1 or y2 <= y1:
         x2 = x1 + max(0.0, x2)
         y2 = y1 + max(0.0, y2)
@@ -207,12 +246,15 @@ def add_bbx(
     y_between: np.ndarray,
 ) -> None:
     boxes_by_frame = extract_bbx_frames(bbx_obj)
+    bbx_ref_size = extract_bbx_reference_size(bbx_obj)
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise FileNotFoundError(f"Konnte Video nicht oeffnen: {video_path}")
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if bbx_ref_size is not None and bbx_ref_size != (w, h):
+        print(f"Skaliere bbx von Referenzgroesse {bbx_ref_size} auf Videogroesse {(w, h)}")
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
@@ -234,7 +276,8 @@ def add_bbx(
             else:
                 color = (0, 0, 255)
             for box_idx in range(frame_boxes.shape[0]):
-                x1, y1, x2, y2 = box_to_xyxy(frame_boxes[box_idx], w, h)
+                ref_w, ref_h = bbx_ref_size if bbx_ref_size is not None else (None, None)
+                x1, y1, x2, y2 = box_to_xyxy(frame_boxes[box_idx], w, h, ref_w, ref_h)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                 if jump:
                     text_y = max(0, y1 - 10)

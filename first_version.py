@@ -201,19 +201,9 @@ def add_bbx(
     video_path: Path,
     bbx_obj,
     out_path: Path,
-    peak_frames: np.ndarray | None = None,
-    jump_windows: np.ndarray | None = None,
+    y_between: np.ndarray,
 ) -> None:
     boxes_by_frame = extract_bbx_frames(bbx_obj)
-    peak_set = set(int(i) for i in (peak_frames.tolist() if peak_frames is not None else []))
-    jump_frame_set = set()
-    if jump_windows is not None and jump_windows.size >= 2:
-        for i in range(0, jump_windows.size - 1, 2):
-            start = int(min(jump_windows[i], jump_windows[i + 1]))
-            end = int(max(jump_windows[i], jump_windows[i + 1]))
-            for f in range(start, end + 1):
-                jump_frame_set.add(f)
-
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise FileNotFoundError(f"Konnte Video nicht oeffnen: {video_path}")
@@ -231,13 +221,30 @@ def add_bbx(
         if frame_idx < len(boxes_by_frame):
             frame_boxes = boxes_by_frame[frame_idx]
             color = (0, 255, 0)
-            if frame_idx in jump_frame_set:
-                color = (0, 255, 255)
-            if frame_idx in peak_set:
+            jump = False
+            for min_f, max_f in zip(y_between[0::2], y_between[1::2]):
+                if min_f < frame_idx < max_f:
+                    jump = True
+                    break
+            if not jump:
+                color = (0, 255, 0)
+            else:
                 color = (0, 0, 255)
             for box_idx in range(frame_boxes.shape[0]):
                 x1, y1, x2, y2 = box_to_xyxy(frame_boxes[box_idx], w, h)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                if jump:
+                    text_y = max(0, y1 - 10)
+                    cv2.putText(
+                        frame,
+                        "jumping",
+                        (x1, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 0, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
         writer.write(frame)
         frame_idx += 1
     cap.release()
@@ -370,7 +377,7 @@ def main():
             plot_file = out_dir / f"{input_file.stem}.png"
             video_file = out_dir / f"{input_file.stem}.mp4"
             plot_transl(transl, y_smooth, y_peaks, title=input_file.name, save_path=plot_file)
-            add_bbx(video_path, bbx, video_file, peak_frames=y_peaks, jump_windows=y_between)
+            add_bbx(video_path, bbx, video_file, y_between)
         elif has_bbx:
             print("no video")
         else:

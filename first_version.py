@@ -67,6 +67,11 @@ def find_first_optional(path: Path, pattern: str) -> Path | None:
 def load_data(input_file: Path):
     base_dir = input_file.parent
     data = load_input_file(input_file)
+    bbx, video_path = load_bbx_and_video(base_dir)
+    return data, bbx, video_path
+
+
+def load_bbx_and_video(base_dir: Path):
     bbx_path = find_first_optional(base_dir, "bbx.pt")
     if bbx_path is not None:
         bbx = load_pt(bbx_path)
@@ -81,7 +86,7 @@ def load_data(input_file: Path):
         video_path = find_first(base_dir, "0_input_video.mp4")
     else:
         video_path = find_first(base_dir, "*.mp4")
-    return data, bbx, video_path
+    return bbx, video_path
 
 
 def _as_numpy(x):
@@ -259,8 +264,7 @@ def add_bbx(
     video_path: Path,
     bbx_obj,
     out_path: Path,
-    y_between: np.ndarray,
-    target_subject_id: int | None = None,
+    jump_ranges_by_subject: dict[int | None, np.ndarray],
 ) -> None:
     boxes_by_frame = extract_bbx_frame_entries(bbx_obj)
     bbx_ref_size = extract_bbx_reference_size(bbx_obj)
@@ -282,19 +286,17 @@ def add_bbx(
             break
         if frame_idx < len(boxes_by_frame):
             frame_boxes = boxes_by_frame[frame_idx]
-            jump = False
-            for min_f, max_f in zip(y_between[0::2], y_between[1::2]):
-                if min_f < frame_idx < max_f:
-                    jump = True
-                    break
             for box_idx, (track_id, box) in enumerate(frame_boxes):
-                if target_subject_id is None:
-                    is_target_subject = len(frame_boxes) == 1 and box_idx == 0
-                elif track_id is None:
-                    is_target_subject = (box_idx + 1) == target_subject_id
-                else:
-                    is_target_subject = track_id == target_subject_id
-                is_jumping_subject = jump and is_target_subject
+                subject_id = track_id if track_id is not None else box_idx + 1
+                jump_ranges = jump_ranges_by_subject.get(subject_id)
+                is_jumping_subject = False
+                if jump_ranges is None and track_id is None and len(frame_boxes) == 1:
+                    jump_ranges = jump_ranges_by_subject.get(None)
+                if jump_ranges is not None:
+                    for min_f, max_f in zip(jump_ranges[0::2], jump_ranges[1::2]):
+                        if min_f < frame_idx < max_f:
+                            is_jumping_subject = True
+                            break
                 color = (0, 0, 255) if is_jumping_subject else (0, 255, 0)
                 ref_w, ref_h = bbx_ref_size if bbx_ref_size is not None else (None, None)
                 x1, y1, x2, y2 = box_to_xyxy(box, w, h, ref_w, ref_h)
@@ -302,7 +304,7 @@ def add_bbx(
                 subject_text_y = max(20, y1 - 10)
                 cv2.putText(
                     frame,
-                    f"subject-{track_id}" if track_id is not None else f"subject-{box_idx + 1}",
+                    f"subject-{subject_id}",
                     (x1, subject_text_y),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
@@ -445,24 +447,33 @@ def main(input_video: str = ""):
     out_root = Path("outputs")
     input_files = sorted(folder.rglob("*hmr4d_results.pt")) + sorted(folder.rglob("*.smpl"))
     print(f"{len(input_files)} files loaded")
+    input_files_by_dir: dict[Path, list[Path]] = {}
     for input_file in sorted(input_files):
-        base_dir = input_file.parent
+        input_files_by_dir.setdefault(input_file.parent, []).append(input_file)
+
+    for base_dir, base_input_files in sorted(input_files_by_dir.items()):
         has_bbx = any(base_dir.rglob("bbx.pt")) or any(base_dir.rglob("results.pkl"))
         has_video = any(base_dir.rglob("*.mp4"))
         if has_bbx and has_video:
-            hmr, bbx, video_path = load_data(input_file)
-            transl = extract_transl(hmr)
-            y_smooth = smooth_1d(transl[:, 1], window=11)
-            y_peaks, y_between = find_peaks_1d(y_smooth)
-            subject_id = None
-            if input_file.stem.startswith("subject-"):
-                subject_id = int(input_file.stem.removeprefix("subject-"))
+            bbx, video_path = load_bbx_and_video(base_dir)
             rel_dir = base_dir.relative_to(folder)
             out_dir = out_root / rel_dir
-            plot_file = out_dir / f"{input_file.stem}.png"
-            video_file = out_dir / f"{input_file.stem}.mp4"
-            plot_transl(transl, y_smooth, y_peaks, title=input_file.name, save_path=plot_file)
-            add_bbx(video_path, bbx, video_file, y_between, target_subject_id=subject_id)
+            jump_ranges_by_subject: dict[int | None, np.ndarray] = {}
+
+            for input_file in sorted(base_input_files):
+                hmr = load_input_file(input_file)
+                transl = extract_transl(hmr)
+                y_smooth = smooth_1d(transl[:, 1], window=11)
+                y_peaks, y_between = find_peaks_1d(y_smooth)
+                subject_id = None
+                if input_file.stem.startswith("subject-"):
+                    subject_id = int(input_file.stem.removeprefix("subject-"))
+                jump_ranges_by_subject[subject_id] = y_between
+                plot_file = out_dir / f"{input_file.stem}.png"
+                plot_transl(transl, y_smooth, y_peaks, title=input_file.name, save_path=plot_file)
+
+            video_file = out_dir / "all_subjects.mp4"
+            add_bbx(video_path, bbx, video_file, jump_ranges_by_subject)
             print("finished ", base_dir)
         elif has_bbx:
             print("no video in ", base_dir)

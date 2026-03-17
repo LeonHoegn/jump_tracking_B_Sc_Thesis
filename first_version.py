@@ -88,28 +88,33 @@ def _as_numpy(x):
     return x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
 
 
-def _merge_tracks_to_frame_boxes(tracks: list[tuple[np.ndarray, np.ndarray]]) -> list[np.ndarray]:
-    max_frame = int(max(np.max(frames) for frames, _ in tracks))
-    boxes_by_frame = [np.empty((0, 4), dtype=float) for _ in range(max_frame + 1)]
+def _merge_tracks_to_frame_entries(
+    tracks: list[tuple[int | None, np.ndarray, np.ndarray]]
+) -> list[list[tuple[int | None, np.ndarray]]]:
+    max_frame = int(max(np.max(frames) for _, frames, _ in tracks))
+    entries_by_frame: list[list[tuple[int | None, np.ndarray]]] = [[] for _ in range(max_frame + 1)]
 
-    for frames, boxes in tracks:
+    for track_id, frames, boxes in tracks:
         for frame_idx, box in zip(frames.astype(int), boxes):
             if frame_idx < 0:
                 continue
-            boxes_by_frame[frame_idx] = np.vstack([boxes_by_frame[frame_idx], box.reshape(1, 4)])
+            entries_by_frame[frame_idx].append((track_id, box.astype(float)))
 
-    return boxes_by_frame
+    return entries_by_frame
 
 
-def extract_bbx_frames(obj) -> list[np.ndarray]:
+def extract_bbx_frame_entries(obj) -> list[list[tuple[int | None, np.ndarray]]]:
     if isinstance(obj, (np.ndarray, torch.Tensor)):
         arr = _as_numpy(obj)
         if arr.ndim == 3 and arr.shape[1] == 1 and arr.shape[2] == 4:
             arr = arr[:, 0, :]
         if arr.ndim == 2 and arr.shape[1] == 4:
-            return [arr[i : i + 1].astype(float) for i in range(arr.shape[0])]
+            return [[(0, arr[i].astype(float))] for i in range(arr.shape[0])]
         if arr.ndim == 3 and arr.shape[2] == 4:
-            return [arr[i].astype(float) for i in range(arr.shape[0])]
+            return [
+                [(box_idx, arr[frame_idx, box_idx].astype(float)) for box_idx in range(arr.shape[1])]
+                for frame_idx in range(arr.shape[0])
+            ]
         raise ValueError(f"Unerwartete bbx-Form: {arr.shape}")
 
     if isinstance(obj, dict):
@@ -117,14 +122,14 @@ def extract_bbx_frames(obj) -> list[np.ndarray]:
         if "people" in obj:
             people = obj["people"]
             if isinstance(people, dict):
-                people_iter = people.values()
+                people_iter = list(people.items())
             elif isinstance(people, (list, tuple)):
-                people_iter = people
+                people_iter = list(enumerate(people, start=1))
             else:
                 raise TypeError(f"Unbekanntes people-Format: {type(people)}")
 
             tracks = []
-            for person in people_iter:
+            for default_track_id, person in people_iter:
                 if not isinstance(person, dict):
                     continue
                 if "frames" not in person:
@@ -145,10 +150,17 @@ def extract_bbx_frames(obj) -> list[np.ndarray]:
                 n = min(frames.shape[0], boxes.shape[0])
                 if n == 0:
                     continue
-                tracks.append((frames[:n].astype(int), boxes[:n].astype(float)))
+                track_id = person.get("track_id", default_track_id)
+                if isinstance(track_id, torch.Tensor):
+                    track_id = int(track_id.item())
+                elif isinstance(track_id, np.ndarray):
+                    track_id = int(track_id.reshape(-1)[0])
+                elif track_id is not None:
+                    track_id = int(track_id)
+                tracks.append((track_id, frames[:n].astype(int), boxes[:n].astype(float)))
 
             if tracks:
-                return _merge_tracks_to_frame_boxes(tracks)
+                return _merge_tracks_to_frame_entries(tracks)
 
             raise KeyError("Konnte in results.pkl keine gueltigen person-bboxes finden.")
 
@@ -162,8 +174,8 @@ def extract_bbx_frames(obj) -> list[np.ndarray]:
                         boxes = boxes.reshape(1, 4)
                     if boxes.ndim == 2 and boxes.shape[1] == 4:
                         n = min(frames.shape[0], boxes.shape[0])
-                        return _merge_tracks_to_frame_boxes(
-                            [(frames[:n].astype(int), boxes[:n].astype(float))]
+                        return _merge_tracks_to_frame_entries(
+                            [(0, frames[:n].astype(int), boxes[:n].astype(float))]
                         )
 
         for k in ["bbx_xyxy", "bbx", "bbox", "bboxes", "boxes"]:
@@ -176,9 +188,12 @@ def extract_bbx_frames(obj) -> list[np.ndarray]:
         if arr.ndim == 3 and arr.shape[1] == 1 and arr.shape[2] == 4:
             arr = arr[:, 0, :]
         if arr.ndim == 2 and arr.shape[1] == 4:
-            return [arr[i : i + 1].astype(float) for i in range(arr.shape[0])]
+            return [[(0, arr[i].astype(float))] for i in range(arr.shape[0])]
         if arr.ndim == 3 and arr.shape[2] == 4:
-            return [arr[i].astype(float) for i in range(arr.shape[0])]
+            return [
+                [(box_idx, arr[frame_idx, box_idx].astype(float)) for box_idx in range(arr.shape[1])]
+                for frame_idx in range(arr.shape[0])
+            ]
         raise ValueError(f"Unerwartete bbx-Form: {arr.shape}")
 
     raise TypeError("Unbekanntes bbx-Format.")
@@ -245,8 +260,9 @@ def add_bbx(
     bbx_obj,
     out_path: Path,
     y_between: np.ndarray,
+    target_subject_id: int | None = None,
 ) -> None:
-    boxes_by_frame = extract_bbx_frames(bbx_obj)
+    boxes_by_frame = extract_bbx_frame_entries(bbx_obj)
     bbx_ref_size = extract_bbx_reference_size(bbx_obj)
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -266,24 +282,27 @@ def add_bbx(
             break
         if frame_idx < len(boxes_by_frame):
             frame_boxes = boxes_by_frame[frame_idx]
-            color = (0, 255, 0)
             jump = False
             for min_f, max_f in zip(y_between[0::2], y_between[1::2]):
                 if min_f < frame_idx < max_f:
                     jump = True
                     break
-            if not jump:
-                color = (0, 255, 0)
-            else:
-                color = (0, 0, 255)
-            for box_idx in range(frame_boxes.shape[0]):
+            for box_idx, (track_id, box) in enumerate(frame_boxes):
+                if target_subject_id is None:
+                    is_target_subject = len(frame_boxes) == 1 and box_idx == 0
+                elif track_id is None:
+                    is_target_subject = (box_idx + 1) == target_subject_id
+                else:
+                    is_target_subject = track_id == target_subject_id
+                is_jumping_subject = jump and is_target_subject
+                color = (0, 0, 255) if is_jumping_subject else (0, 255, 0)
                 ref_w, ref_h = bbx_ref_size if bbx_ref_size is not None else (None, None)
-                x1, y1, x2, y2 = box_to_xyxy(frame_boxes[box_idx], w, h, ref_w, ref_h)
+                x1, y1, x2, y2 = box_to_xyxy(box, w, h, ref_w, ref_h)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                 subject_text_y = max(20, y1 - 10)
                 cv2.putText(
                     frame,
-                    f"subject-{box_idx + 1}",
+                    f"subject-{track_id}" if track_id is not None else f"subject-{box_idx + 1}",
                     (x1, subject_text_y),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
@@ -291,7 +310,7 @@ def add_bbx(
                     2,
                     cv2.LINE_AA,
                 )
-                if jump:
+                if is_jumping_subject:
                     text_y = min(h - 10, y1 + 25)
                     cv2.putText(
                         frame,
@@ -435,12 +454,15 @@ def main(input_video: str = ""):
             transl = extract_transl(hmr)
             y_smooth = smooth_1d(transl[:, 1], window=11)
             y_peaks, y_between = find_peaks_1d(y_smooth)
+            subject_id = None
+            if input_file.stem.startswith("subject-"):
+                subject_id = int(input_file.stem.removeprefix("subject-"))
             rel_dir = base_dir.relative_to(folder)
             out_dir = out_root / rel_dir
             plot_file = out_dir / f"{input_file.stem}.png"
             video_file = out_dir / f"{input_file.stem}.mp4"
             plot_transl(transl, y_smooth, y_peaks, title=input_file.name, save_path=plot_file)
-            add_bbx(video_path, bbx, video_file, y_between)
+            add_bbx(video_path, bbx, video_file, y_between, target_subject_id=subject_id)
             print("finished ", base_dir)
         elif has_bbx:
             print("no video in ", base_dir)

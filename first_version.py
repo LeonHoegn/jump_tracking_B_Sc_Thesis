@@ -548,10 +548,10 @@ def process_subject_file(input_file: Path, out_dir: Path) -> tuple[int | None, n
     return subject_id, jump_ranges
 
 
-def main(input_video: str = "") -> None:
+def main(i: str = "") -> None:
     """Run the jump detection visualization pipeline for the selected input folder."""
     inputs_root = Path("inputs")
-    folder = inputs_root if input_video == "" else inputs_root / input_video
+    folder = inputs_root if i == "" else inputs_root / i
 
     if not folder.exists():
         raise FileNotFoundError(f"Input folder not found: {folder}")

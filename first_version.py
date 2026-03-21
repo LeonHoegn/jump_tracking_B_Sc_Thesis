@@ -1,35 +1,56 @@
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-import cv2
+from __future__ import annotations
+
 import pickle
 from pathlib import Path
+from typing import Any
+
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
 import tyro
 
-def get_threshold():
-    return 0.2
-def get_fps():
-    return 30
-def get_controll_time():
-    return 0.2
+DEFAULT_THRESHOLD = 0.2
+DEFAULT_FPS = 30
+DEFAULT_CONTROL_TIME = 0.2
+BOX_KEYS = ("bboxes", "bbx", "bbox", "boxes")
+TRANSLATION_KEYS = ("transl", "translation", "root_transl", "root_translation")
 
-def load_pt(path: Path):
+
+def get_threshold() -> float:
+    """Return the minimum jump amplitude threshold."""
+    return DEFAULT_THRESHOLD
+
+
+def get_fps() -> int:
+    """Return the default fallback frames-per-second value."""
+    return DEFAULT_FPS
+
+
+def get_controll_time() -> float:
+    """Return the legacy control time value."""
+    return DEFAULT_CONTROL_TIME
+
+
+def load_pt(path: Path) -> Any:
+    """Load a PyTorch file on CPU."""
     return torch.load(path, map_location="cpu")
 
 
-def load_smpl(path: Path):
+def load_smpl(path: Path) -> Any:
+    """Load a PromptHMR `.smpl` file or any NumPy-backed container."""
     data = np.load(path, allow_pickle=True)
 
-    # .smpl from PromptHMR is a zip-based numpy container (npz-like)
     if isinstance(data, np.lib.npyio.NpzFile):
-        out = {k: data[k] for k in data.files}
+        loaded = {key: data[key] for key in data.files}
         data.close()
-        return out
+        return loaded
 
     return data
 
 
-def load_input_file(path: Path):
+def load_input_file(path: Path) -> Any:
+    """Load a supported model output file."""
     suffix = path.suffix.lower()
     if suffix == ".pt":
         return load_pt(path)
@@ -38,198 +59,227 @@ def load_input_file(path: Path):
     raise ValueError(f"Unsupported input file type: {path}")
 
 
-def load_pkl(path: Path):
+def load_pkl(path: Path) -> Any:
+    """Load a pickle file, falling back to joblib when necessary."""
     try:
-        with open(path, "rb") as f:
-            return pickle.load(f)
+        with path.open("rb") as file:
+            return pickle.load(file)
     except Exception as pickle_error:
         try:
             import joblib  # type: ignore
+
             return joblib.load(path)
         except Exception as joblib_error:
             raise RuntimeError(
-                f"Konnte {path} nicht laden (pickle: {pickle_error}, joblib: {joblib_error})"
+                f"Could not load {path} "
+                f"(pickle: {pickle_error}, joblib: {joblib_error})"
             ) from joblib_error
 
 
 def find_first(path: Path, pattern: str) -> Path:
+    """Return the first matching file for a glob pattern."""
     matches = sorted(path.rglob(pattern))
     if not matches:
-        raise FileNotFoundError(f"Kein Treffer fuer '{pattern}' in {path}")
+        raise FileNotFoundError(f"No match found for '{pattern}' in {path}")
     return matches[0]
 
 
 def find_first_optional(path: Path, pattern: str) -> Path | None:
+    """Return the first matching file or `None` if no match exists."""
     matches = sorted(path.rglob(pattern))
     return matches[0] if matches else None
 
 
-def load_data(input_file: Path):
+def load_data(input_file: Path) -> tuple[Any, Any, Path]:
+    """Load a result file together with its bounding boxes and video."""
     base_dir = input_file.parent
     data = load_input_file(input_file)
-    bbx, video_path = load_bbx_and_video(base_dir)
-    return data, bbx, video_path
+    bounding_boxes, video_path = load_bbx_and_video(base_dir)
+    return data, bounding_boxes, video_path
 
 
-def load_bbx_and_video(base_dir: Path):
+def load_bbx_and_video(base_dir: Path) -> tuple[Any, Path]:
+    """Load bounding box data and the matching input video for a directory."""
     bbx_path = find_first_optional(base_dir, "bbx.pt")
     if bbx_path is not None:
-        bbx = load_pt(bbx_path)
+        bounding_boxes = load_pt(bbx_path)
     else:
         results_path = find_first_optional(base_dir, "results.pkl")
         if results_path is None:
             raise FileNotFoundError(
-                f"Keine Bounding-Box Quelle gefunden in {base_dir} (erwartet: bbx.pt oder results.pkl)"
+                "No bounding box source found in "
+                f"{base_dir} (expected `bbx.pt` or `results.pkl`)."
             )
-        bbx = load_pkl(results_path)
-    if (any(base_dir.rglob("0_input_video.mp4"))):
-        video_path = find_first(base_dir, "0_input_video.mp4")
-    else:
-        video_path = find_first(base_dir, "*.mp4")
-    return bbx, video_path
+        bounding_boxes = load_pkl(results_path)
+
+    preferred_video = find_first_optional(base_dir, "0_input_video.mp4")
+    video_path = preferred_video if preferred_video is not None else find_first(base_dir, "*.mp4")
+    return bounding_boxes, video_path
 
 
-def _as_numpy(x):
-    return x.detach().cpu().numpy() if isinstance(x, torch.Tensor) else np.asarray(x)
+def as_numpy(value: Any) -> np.ndarray:
+    """Convert tensors and array-like inputs to NumPy arrays."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    return np.asarray(value)
 
 
-def _merge_tracks_to_frame_entries(
-    tracks: list[tuple[int | None, np.ndarray, np.ndarray]]
+def normalize_track_id(track_id: Any) -> int | None:
+    """Convert track identifiers to plain Python integers."""
+    if track_id is None:
+        return None
+    if isinstance(track_id, torch.Tensor):
+        return int(track_id.item())
+    if isinstance(track_id, np.ndarray):
+        return int(track_id.reshape(-1)[0])
+    return int(track_id)
+
+
+def merge_tracks_to_frame_entries(
+    tracks: list[tuple[int | None, np.ndarray, np.ndarray]],
 ) -> list[list[tuple[int | None, np.ndarray]]]:
+    """Convert per-track boxes into a per-frame representation."""
     max_frame = int(max(np.max(frames) for _, frames, _ in tracks))
     entries_by_frame: list[list[tuple[int | None, np.ndarray]]] = [[] for _ in range(max_frame + 1)]
 
     for track_id, frames, boxes in tracks:
-        for frame_idx, box in zip(frames.astype(int), boxes):
-            if frame_idx < 0:
+        for frame_index, box in zip(frames.astype(int), boxes):
+            if frame_index < 0:
                 continue
-            entries_by_frame[frame_idx].append((track_id, box.astype(float)))
+            entries_by_frame[frame_index].append((track_id, box.astype(float)))
 
     return entries_by_frame
 
 
-def extract_bbx_frame_entries(obj) -> list[list[tuple[int | None, np.ndarray]]]:
-    if isinstance(obj, (np.ndarray, torch.Tensor)):
-        arr = _as_numpy(obj)
-        if arr.ndim == 3 and arr.shape[1] == 1 and arr.shape[2] == 4:
-            arr = arr[:, 0, :]
-        if arr.ndim == 2 and arr.shape[1] == 4:
-            return [[(0, arr[i].astype(float))] for i in range(arr.shape[0])]
-        if arr.ndim == 3 and arr.shape[2] == 4:
-            return [
-                [(box_idx, arr[frame_idx, box_idx].astype(float)) for box_idx in range(arr.shape[1])]
-                for frame_idx in range(arr.shape[0])
-            ]
-        raise ValueError(f"Unerwartete bbx-Form: {arr.shape}")
+def array_boxes_to_frame_entries(box_array: np.ndarray) -> list[list[tuple[int | None, np.ndarray]]]:
+    """Normalize array-based box layouts into per-frame entries."""
+    if box_array.ndim == 3 and box_array.shape[1] == 1 and box_array.shape[2] == 4:
+        box_array = box_array[:, 0, :]
 
-    if isinstance(obj, dict):
-        # PromptHMR results.pkl: obj["people"][track_id] -> {"frames": ..., "bboxes": ...}
-        if "people" in obj:
-            people = obj["people"]
-            if isinstance(people, dict):
-                people_iter = list(people.items())
-            elif isinstance(people, (list, tuple)):
-                people_iter = list(enumerate(people, start=1))
-            else:
-                raise TypeError(f"Unbekanntes people-Format: {type(people)}")
+    if box_array.ndim == 2 and box_array.shape[1] == 4:
+        return [[(0, box_array[index].astype(float))] for index in range(box_array.shape[0])]
 
-            tracks = []
-            for default_track_id, person in people_iter:
-                if not isinstance(person, dict):
-                    continue
-                if "frames" not in person:
-                    continue
-                bboxes = None
-                for k in ["bboxes", "bbx", "bbox", "boxes"]:
-                    if k in person:
-                        bboxes = person[k]
-                        break
-                if bboxes is None:
-                    continue
-                frames = _as_numpy(person["frames"]).reshape(-1)
-                boxes = _as_numpy(bboxes)
-                if boxes.ndim == 1 and boxes.shape[0] == 4:
-                    boxes = boxes.reshape(1, 4)
-                if boxes.ndim != 2 or boxes.shape[1] != 4:
-                    continue
-                n = min(frames.shape[0], boxes.shape[0])
-                if n == 0:
-                    continue
-                track_id = person.get("track_id", default_track_id)
-                if isinstance(track_id, torch.Tensor):
-                    track_id = int(track_id.item())
-                elif isinstance(track_id, np.ndarray):
-                    track_id = int(track_id.reshape(-1)[0])
-                elif track_id is not None:
-                    track_id = int(track_id)
-                tracks.append((track_id, frames[:n].astype(int), boxes[:n].astype(float)))
+    if box_array.ndim == 3 and box_array.shape[2] == 4:
+        return [
+            [(box_index, box_array[frame_index, box_index].astype(float)) for box_index in range(box_array.shape[1])]
+            for frame_index in range(box_array.shape[0])
+        ]
 
-            if tracks:
-                return _merge_tracks_to_frame_entries(tracks)
+    raise ValueError(f"Unexpected bounding box shape: {box_array.shape}")
 
-            raise KeyError("Konnte in results.pkl keine gueltigen person-bboxes finden.")
 
-        # Einfache Dict-Varianten
-        if "frames" in obj:
-            for k in ["bboxes", "bbx", "bbox", "boxes"]:
-                if k in obj:
-                    frames = _as_numpy(obj["frames"]).reshape(-1)
-                    boxes = _as_numpy(obj[k])
-                    if boxes.ndim == 1 and boxes.shape[0] == 4:
-                        boxes = boxes.reshape(1, 4)
-                    if boxes.ndim == 2 and boxes.shape[1] == 4:
-                        n = min(frames.shape[0], boxes.shape[0])
-                        return _merge_tracks_to_frame_entries(
-                            [(0, frames[:n].astype(int), boxes[:n].astype(float))]
-                        )
+def extract_people_tracks(people: Any) -> list[tuple[int | None, np.ndarray, np.ndarray]]:
+    """Extract tracked people from PromptHMR-style `results.pkl` content."""
+    if isinstance(people, dict):
+        people_items = list(people.items())
+    elif isinstance(people, (list, tuple)):
+        people_items = list(enumerate(people, start=1))
+    else:
+        raise TypeError(f"Unknown `people` format: {type(people)}")
 
-        for k in ["bbx_xyxy", "bbx", "bbox", "bboxes", "boxes"]:
-            if k in obj:
-                arr = _as_numpy(obj[k])
+    tracks: list[tuple[int | None, np.ndarray, np.ndarray]] = []
+    for default_track_id, person in people_items:
+        if not isinstance(person, dict) or "frames" not in person:
+            continue
+
+        boxes = None
+        for key in BOX_KEYS:
+            if key in person:
+                boxes = person[key]
                 break
-        else:
-            raise KeyError("Konnte keine Bounding-Boxes finden. Bitte Key-Pfad nennen.")
+        if boxes is None:
+            continue
 
-        if arr.ndim == 3 and arr.shape[1] == 1 and arr.shape[2] == 4:
-            arr = arr[:, 0, :]
-        if arr.ndim == 2 and arr.shape[1] == 4:
-            return [[(0, arr[i].astype(float))] for i in range(arr.shape[0])]
-        if arr.ndim == 3 and arr.shape[2] == 4:
-            return [
-                [(box_idx, arr[frame_idx, box_idx].astype(float)) for box_idx in range(arr.shape[1])]
-                for frame_idx in range(arr.shape[0])
-            ]
-        raise ValueError(f"Unerwartete bbx-Form: {arr.shape}")
+        frames = as_numpy(person["frames"]).reshape(-1)
+        box_array = as_numpy(boxes)
+        if box_array.ndim == 1 and box_array.shape[0] == 4:
+            box_array = box_array.reshape(1, 4)
+        if box_array.ndim != 2 or box_array.shape[1] != 4:
+            continue
 
-    raise TypeError("Unbekanntes bbx-Format.")
+        item_count = min(frames.shape[0], box_array.shape[0])
+        if item_count == 0:
+            continue
+
+        track_id = normalize_track_id(person.get("track_id", default_track_id))
+        tracks.append(
+            (
+                track_id,
+                frames[:item_count].astype(int),
+                box_array[:item_count].astype(float),
+            )
+        )
+
+    return tracks
 
 
-def extract_bbx_reference_size(obj) -> tuple[int, int] | None:
-    if not isinstance(obj, dict):
+def extract_bbx_frame_entries(bounding_boxes: Any) -> list[list[tuple[int | None, np.ndarray]]]:
+    """Extract bounding boxes into a `frame -> [(track_id, box)]` layout."""
+    if isinstance(bounding_boxes, (np.ndarray, torch.Tensor)):
+        return array_boxes_to_frame_entries(as_numpy(bounding_boxes))
+
+    if isinstance(bounding_boxes, dict):
+        if "people" in bounding_boxes:
+            tracks = extract_people_tracks(bounding_boxes["people"])
+            if tracks:
+                return merge_tracks_to_frame_entries(tracks)
+            raise KeyError("Could not find valid person bounding boxes in `results.pkl`.")
+
+        if "frames" in bounding_boxes:
+            frames = as_numpy(bounding_boxes["frames"]).reshape(-1)
+            for key in BOX_KEYS:
+                if key not in bounding_boxes:
+                    continue
+                box_array = as_numpy(bounding_boxes[key])
+                if box_array.ndim == 1 and box_array.shape[0] == 4:
+                    box_array = box_array.reshape(1, 4)
+                if box_array.ndim == 2 and box_array.shape[1] == 4:
+                    item_count = min(frames.shape[0], box_array.shape[0])
+                    tracks = [(0, frames[:item_count].astype(int), box_array[:item_count].astype(float))]
+                    return merge_tracks_to_frame_entries(tracks)
+
+        for key in ("bbx_xyxy", "bbx", "bbox", "bboxes", "boxes"):
+            if key in bounding_boxes:
+                return array_boxes_to_frame_entries(as_numpy(bounding_boxes[key]))
+
+        raise KeyError("Could not find bounding boxes. Please specify the correct key path.")
+
+    raise TypeError("Unknown bounding box format.")
+
+
+def extract_bbx_reference_size(bounding_boxes: Any) -> tuple[int, int] | None:
+    """Extract the reference image size used when the boxes were generated."""
+    if not isinstance(bounding_boxes, dict):
         return None
-    camera = obj.get("camera")
+
+    camera = bounding_boxes.get("camera")
     if not isinstance(camera, dict):
         return None
-    img_center = camera.get("img_center")
-    if img_center is None:
+
+    image_center = camera.get("img_center")
+    if image_center is None:
         return None
-    center = _as_numpy(img_center).reshape(-1)
+
+    center = as_numpy(image_center).reshape(-1)
     if center.size < 2:
         return None
-    ref_w = int(round(float(center[0]) * 2.0))
-    ref_h = int(round(float(center[1]) * 2.0))
-    if ref_w <= 0 or ref_h <= 0:
+
+    reference_width = int(round(float(center[0]) * 2.0))
+    reference_height = int(round(float(center[1]) * 2.0))
+    if reference_width <= 0 or reference_height <= 0:
         return None
-    return ref_w, ref_h
+
+    return reference_width, reference_height
 
 
 def box_to_xyxy(
     box: np.ndarray,
-    w: int,
-    h: int,
-    ref_w: int | None = None,
-    ref_h: int | None = None,
+    width: int,
+    height: int,
+    reference_width: int | None = None,
+    reference_height: int | None = None,
 ) -> tuple[int, int, int, int]:
+    """Convert a box representation into pixel-based `(x1, y1, x2, y2)` coordinates."""
     box = box.astype(float)
     if box.shape == (2, 2):
         x1, y1 = box[0]
@@ -237,129 +287,157 @@ def box_to_xyxy(
     elif box.shape == (4,):
         x1, y1, x2, y2 = box
     else:
-        raise ValueError(f"Unerwartete Box-Form fuer xyxy-Konvertierung: {box.shape}")
-    if 0.0 <= x2 <= 1.5 and 0.0 <= y2 <= 1.5 and 0.0 <= x1 <= 1.5 and 0.0 <= y1 <= 1.5:
-        x1 *= w
-        x2 *= w
-        y1 *= h
-        y2 *= h
-    elif ref_w is not None and ref_h is not None and (ref_w != w or ref_h != h):
-        scale_x = w / float(ref_w)
-        scale_y = h / float(ref_h)
+        raise ValueError(f"Unexpected box shape for xyxy conversion: {box.shape}")
+
+    if all(0.0 <= value <= 1.5 for value in (x1, y1, x2, y2)):
+        x1 *= width
+        x2 *= width
+        y1 *= height
+        y2 *= height
+    elif (
+        reference_width is not None
+        and reference_height is not None
+        and (reference_width != width or reference_height != height)
+    ):
+        scale_x = width / float(reference_width)
+        scale_y = height / float(reference_height)
         x1 *= scale_x
         x2 *= scale_x
         y1 *= scale_y
         y2 *= scale_y
+
     if x2 <= x1 or y2 <= y1:
         x2 = x1 + max(0.0, x2)
         y2 = y1 + max(0.0, y2)
-    x1i = max(0, min(int(round(x1)), w - 1))
-    y1i = max(0, min(int(round(y1)), h - 1))
-    x2i = max(0, min(int(round(x2)), w - 1))
-    y2i = max(0, min(int(round(y2)), h - 1))
-    return x1i, y1i, x2i, y2i
+
+    x1_int = max(0, min(int(round(x1)), width - 1))
+    y1_int = max(0, min(int(round(y1)), height - 1))
+    x2_int = max(0, min(int(round(x2)), width - 1))
+    y2_int = max(0, min(int(round(y2)), height - 1))
+    return x1_int, y1_int, x2_int, y2_int
+
+
+def is_jumping_frame(frame_index: int, jump_ranges: np.ndarray | None) -> bool:
+    """Return whether a frame lies inside one of the detected jump intervals."""
+    if jump_ranges is None:
+        return False
+
+    for start_frame, end_frame in zip(jump_ranges[0::2], jump_ranges[1::2]):
+        if start_frame < frame_index < end_frame:
+            return True
+
+    return False
 
 
 def add_bbx(
     video_path: Path,
-    bbx_obj,
+    bbx_obj: Any,
     out_path: Path,
     jump_ranges_by_subject: dict[int | None, np.ndarray],
 ) -> None:
+    """Render subject bounding boxes and jump labels into a video."""
     boxes_by_frame = extract_bbx_frame_entries(bbx_obj)
-    bbx_ref_size = extract_bbx_reference_size(bbx_obj)
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise FileNotFoundError(f"Konnte Video nicht oeffnen: {video_path}")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    if bbx_ref_size is not None and bbx_ref_size != (w, h):
-        print(f"Skaliere bbx von Referenzgroesse {bbx_ref_size} auf Videogroesse {(w, h)}")
+    bbx_reference_size = extract_bbx_reference_size(bbx_obj)
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise FileNotFoundError(f"Could not open video: {video_path}")
+
+    fps = capture.get(cv2.CAP_PROP_FPS) or float(get_fps())
+    frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    if bbx_reference_size is not None and bbx_reference_size != (frame_width, frame_height):
+        print(
+            "Scaling bounding boxes from reference size "
+            f"{bbx_reference_size} to video size {(frame_width, frame_height)}"
+        )
+
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
-    frame_idx = 0
+    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (frame_width, frame_height))
+
+    frame_index = 0
     while True:
-        ret, frame = cap.read()
-        if not ret:
+        ok, frame = capture.read()
+        if not ok:
             break
-        if frame_idx < len(boxes_by_frame):
-            frame_boxes = boxes_by_frame[frame_idx]
-            for box_idx, (track_id, box) in enumerate(frame_boxes):
-                subject_id = track_id if track_id is not None else box_idx + 1
+
+        if frame_index < len(boxes_by_frame):
+            frame_boxes = boxes_by_frame[frame_index]
+            for fallback_subject_index, (track_id, box) in enumerate(frame_boxes, start=1):
+                subject_id = track_id if track_id is not None else fallback_subject_index
                 jump_ranges = jump_ranges_by_subject.get(subject_id)
-                is_jumping_subject = False
+
                 if jump_ranges is None and track_id is None and len(frame_boxes) == 1:
                     jump_ranges = jump_ranges_by_subject.get(None)
-                if jump_ranges is not None:
-                    for min_f, max_f in zip(jump_ranges[0::2], jump_ranges[1::2]):
-                        if min_f < frame_idx < max_f:
-                            is_jumping_subject = True
-                            break
+
+                is_jumping_subject = is_jumping_frame(frame_index, jump_ranges)
                 color = (0, 0, 255) if is_jumping_subject else (0, 255, 0)
-                ref_w, ref_h = bbx_ref_size if bbx_ref_size is not None else (None, None)
-                x1, y1, x2, y2 = box_to_xyxy(box, w, h, ref_w, ref_h)
+                reference_width, reference_height = (
+                    bbx_reference_size if bbx_reference_size is not None else (None, None)
+                )
+                x1, y1, x2, y2 = box_to_xyxy(
+                    box,
+                    frame_width,
+                    frame_height,
+                    reference_width,
+                    reference_height,
+                )
+
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                subject_text_y = max(20, y1 - 10)
+                label_y = max(20, y1 - 10)
                 cv2.putText(
                     frame,
                     f"subject-{subject_id}",
-                    (x1, subject_text_y),
+                    (x1, label_y),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.7,
                     color,
                     2,
                     cv2.LINE_AA,
                 )
+
                 if is_jumping_subject:
-                    text_y = min(h - 10, y1 + 25)
+                    jumping_label_y = min(frame_height - 10, y1 + 25)
                     cv2.putText(
                         frame,
                         "jumping",
-                        (x1, text_y),
+                        (x1, jumping_label_y),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.7,
                         (0, 0, 255),
                         2,
                         cv2.LINE_AA,
                     )
+
         writer.write(frame)
-        frame_idx += 1
-    cap.release()
+        frame_index += 1
+
+    capture.release()
     writer.release()
 
 
-def extract_transl(obj):
-    """
-    Versucht transl (T,3) aus typischen Strukturen zu holen.
-    Passe die Key-Pfade an dein Format an, falls nötig.
-    """
-    # Fall 1: direkt Tensor/Array
+def extract_transl(obj: Any) -> np.ndarray:
+    """Extract a translation array with shape `(T, 3)` from common result layouts."""
     if isinstance(obj, (np.ndarray, torch.Tensor)):
-        arr = obj.detach().cpu().numpy() if isinstance(obj, torch.Tensor) else obj
-        if arr.ndim == 2 and arr.shape[1] == 3:
-            return arr
+        transl = as_numpy(obj)
+        if transl.ndim == 2 and transl.shape[1] == 3:
+            return transl
 
-    # Fall 2: dict mit bekannten Keys !!fall bei GVHMR aus hmr4d_results.pt
     if isinstance(obj, dict):
-        # häufig: pred["smpl_params_global"]["transl"]
-        if "smpl_params_global" in obj and isinstance(obj["smpl_params_global"], dict):
-            if "transl" in obj["smpl_params_global"]:
-                t = obj["smpl_params_global"]["transl"]
-                return t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else np.asarray(t)
+        global_params = obj.get("smpl_params_global")
+        if isinstance(global_params, dict) and "transl" in global_params:
+            return as_numpy(global_params["transl"])
 
-        # andere Varianten
-        for k in ["transl", "translation", "root_transl", "root_translation"]:
-            if k in obj:
-                t = obj[k]
-                return t.detach().cpu().numpy() if isinstance(t, torch.Tensor) else np.asarray(t)
+        for key in TRANSLATION_KEYS:
+            if key in obj:
+                return as_numpy(obj[key])
 
-        # PromptHMR .smpl format
         if "bodyTranslation" in obj:
             return np.asarray(obj["bodyTranslation"])
 
-    raise KeyError("Konnte keine transl (T,3) finden. Bitte Key-Pfad nennen.")
+    raise KeyError("Could not find translation data with shape `(T, 3)`.")
 
 
 def plot_transl(
@@ -368,9 +446,10 @@ def plot_transl(
     y_peaks: np.ndarray,
     title: str,
     save_path: Path | None = None,
-):
+) -> None:
+    """Plot raw and smoothed translation curves and optionally save the figure."""
     plt.figure()
-    plt.plot(transl[:, 0], label="z")
+    plt.plot(transl[:, 0], label="x")
     plt.plot(y_smooth, label="y (smooth)")
     if y_peaks.size >= 1:
         plt.scatter(y_peaks, y_smooth[y_peaks], color="red", s=20, zorder=3, label="y peaks")
@@ -380,106 +459,130 @@ def plot_transl(
     plt.title(title)
     plt.legend()
     plt.tight_layout()
+
     if save_path is not None:
         save_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(save_path, dpi=150)
         plt.close()
         return
+
     plt.show()
 
 
-def smooth_1d(x: np.ndarray, window: int = 11) -> np.ndarray:
+def smooth_1d(values: np.ndarray, window: int = 11) -> np.ndarray:
+    """Apply edge-padded moving-average smoothing to a 1D signal."""
     if window <= 1:
-        return x
+        return values
     if window % 2 == 0:
         window += 1
-    pad = window // 2
-    x_pad = np.pad(x, (pad, pad), mode="edge")
+
+    padding = window // 2
+    padded_values = np.pad(values, (padding, padding), mode="edge")
     kernel = np.ones(window, dtype=float) / float(window)
-    return np.convolve(x_pad, kernel, mode="valid")
+    return np.convolve(padded_values, kernel, mode="valid")
 
 
-def find_peaks_1d(x: np.ndarray) -> np.ndarray:
-    # Lokale Maxima: x[i-1] < x[i] >= x[i+1]
-    if x.size < 3:
-        return np.array([], dtype=int)
-    prev = x[:-2]
-    curr = x[1:-1]
-    nxt = x[2:]
-    high_points = np.where((curr > prev) & (curr >= nxt))[0] + 1
+def find_peaks_1d(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Detect jump peaks and the surrounding low points in a 1D signal."""
+    if values.size < 3:
+        empty = np.array([], dtype=int)
+        return empty, empty
 
-    low_points = np.where((curr < prev) & (curr <= nxt))[0] + 1
+    previous_values = values[:-2]
+    current_values = values[1:-1]
+    next_values = values[2:]
 
-    if x[0] < x[1]:
+    high_points = np.where((current_values > previous_values) & (current_values >= next_values))[0] + 1
+    low_points = np.where((current_values < previous_values) & (current_values <= next_values))[0] + 1
+
+    if values[0] < values[1]:
         low_points = np.insert(low_points, 0, 0)
 
-    high_points_over_th = []
-    between_low_points = []
+    qualifying_high_points: list[int] = []
+    surrounding_low_points: list[int] = []
+    mean_value = float(np.mean(values))
+    threshold = get_threshold()
 
-    x_mean = np.mean(x)
-
-    for hp in high_points:
-        # Need one low point left and one right of the high point.
-        right_idx = np.searchsorted(low_points, hp, side="right")
-        left_idx = right_idx - 1
-        if left_idx < 0 or right_idx >= low_points.shape[0]:
+    for high_point in high_points:
+        right_index = int(np.searchsorted(low_points, high_point, side="right"))
+        left_index = right_index - 1
+        if left_index < 0 or right_index >= low_points.shape[0]:
             continue
 
-        left_low = int(low_points[left_idx])
-        right_low = int(low_points[right_idx])
-        th = get_threshold()
-        diff = x[hp] - x[left_low]
-        if (diff >= th) and (x_mean < x[hp] + (0.8 * th)):
-            high_points_over_th.append(hp)
-            between_low_points.append(left_low)
-            between_low_points.append(right_low)
+        left_low = int(low_points[left_index])
+        right_low = int(low_points[right_index])
+        amplitude = values[high_point] - values[left_low]
 
-    return np.array(high_points_over_th, dtype=int), np.array(between_low_points, dtype=int)
+        if amplitude >= threshold and mean_value < values[high_point] + (0.8 * threshold):
+            qualifying_high_points.append(int(high_point))
+            surrounding_low_points.extend((left_low, right_low))
+
+    return np.array(qualifying_high_points, dtype=int), np.array(surrounding_low_points, dtype=int)
 
 
-def main(input_video: str = ""):
-    inputs_root = Path("inputs")
-    folder = inputs_root if input_video == "" else inputs_root / input_video
-    if not folder.exists():
-        raise FileNotFoundError(f"Eingabeordner nicht gefunden: {folder}")
-    if not folder.is_dir():
-        raise NotADirectoryError(f"Eingabepfad ist kein Ordner: {folder}")
-    out_root = Path("outputs")
+def collect_input_files(folder: Path) -> dict[Path, list[Path]]:
+    """Group supported input files by their parent directory."""
     input_files = sorted(folder.rglob("*hmr4d_results.pt")) + sorted(folder.rglob("*.smpl"))
     print(f"{len(input_files)} files loaded")
-    input_files_by_dir: dict[Path, list[Path]] = {}
+
+    grouped_files: dict[Path, list[Path]] = {}
     for input_file in sorted(input_files):
-        input_files_by_dir.setdefault(input_file.parent, []).append(input_file)
+        grouped_files.setdefault(input_file.parent, []).append(input_file)
+
+    return grouped_files
+
+
+def process_subject_file(input_file: Path, out_dir: Path) -> tuple[int | None, np.ndarray]:
+    """Process one subject file and return its inferred jump ranges."""
+    hmr_output = load_input_file(input_file)
+    transl = extract_transl(hmr_output)
+    y_smooth = smooth_1d(transl[:, 1], window=11)
+    y_peaks, jump_ranges = find_peaks_1d(y_smooth)
+
+    subject_id = None
+    if input_file.stem.startswith("subject-"):
+        subject_id = int(input_file.stem.removeprefix("subject-"))
+
+    plot_path = out_dir / f"{input_file.stem}.png"
+    plot_transl(transl, y_smooth, y_peaks, title=input_file.name, save_path=plot_path)
+    return subject_id, jump_ranges
+
+
+def main(input_video: str = "") -> None:
+    """Run the jump detection visualization pipeline for the selected input folder."""
+    inputs_root = Path("inputs")
+    folder = inputs_root if input_video == "" else inputs_root / input_video
+
+    if not folder.exists():
+        raise FileNotFoundError(f"Input folder not found: {folder}")
+    if not folder.is_dir():
+        raise NotADirectoryError(f"Input path is not a directory: {folder}")
+
+    output_root = Path("outputs")
+    input_files_by_dir = collect_input_files(folder)
 
     for base_dir, base_input_files in sorted(input_files_by_dir.items()):
         has_bbx = any(base_dir.rglob("bbx.pt")) or any(base_dir.rglob("results.pkl"))
         has_video = any(base_dir.rglob("*.mp4"))
+
         if has_bbx and has_video:
-            bbx, video_path = load_bbx_and_video(base_dir)
-            rel_dir = base_dir.relative_to(folder)
-            out_dir = out_root / rel_dir
+            bbx_obj, video_path = load_bbx_and_video(base_dir)
+            relative_dir = base_dir.relative_to(folder)
+            out_dir = output_root / relative_dir
             jump_ranges_by_subject: dict[int | None, np.ndarray] = {}
 
             for input_file in sorted(base_input_files):
-                hmr = load_input_file(input_file)
-                transl = extract_transl(hmr)
-                y_smooth = smooth_1d(transl[:, 1], window=11)
-                y_peaks, y_between = find_peaks_1d(y_smooth)
-                subject_id = None
-                if input_file.stem.startswith("subject-"):
-                    subject_id = int(input_file.stem.removeprefix("subject-"))
-                jump_ranges_by_subject[subject_id] = y_between
-                plot_file = out_dir / f"{input_file.stem}.png"
-                plot_transl(transl, y_smooth, y_peaks, title=input_file.name, save_path=plot_file)
+                subject_id, jump_ranges = process_subject_file(input_file, out_dir)
+                jump_ranges_by_subject[subject_id] = jump_ranges
 
             video_file = out_dir / "all_subjects.mp4"
-            add_bbx(video_path, bbx, video_file, jump_ranges_by_subject)
-            print("finished ", base_dir)
+            add_bbx(video_path, bbx_obj, video_file, jump_ranges_by_subject)
+            print(f"Finished {base_dir}")
         elif has_bbx:
-            print("no video in ", base_dir)
+            print(f"No video found in {base_dir}")
         else:
-            print("no bbx in ", base_dir)
+            print(f"No bounding boxes found in {base_dir}")
 
 
 if __name__ == "__main__":
-    tyro.cli(main())
+    tyro.cli(main)

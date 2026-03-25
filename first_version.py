@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import pickle
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,27 @@ DEFAULT_FPS = 30
 DEFAULT_CONTROL_TIME = 0.2
 BOX_KEYS = ("bboxes", "bbx", "bbox", "boxes")
 TRANSLATION_KEYS = ("transl", "translation", "root_transl", "root_translation")
+
+TrackData = tuple[int | None, np.ndarray, np.ndarray]
+
+
+@dataclass(frozen=True)
+class SubjectBoundary:
+    """Representative subject positions at the start and end of a video segment."""
+
+    first_center: np.ndarray
+    last_center: np.ndarray
+
+
+@dataclass(frozen=True)
+class VideoSegment:
+    """All data needed to process one input video directory."""
+
+    base_dir: Path
+    input_files: list[Path]
+    bbx_obj: Any
+    video_path: Path
+    subject_boundaries: dict[int | None, SubjectBoundary]
 
 
 def get_threshold() -> float:
@@ -136,7 +159,7 @@ def normalize_track_id(track_id: Any) -> int | None:
 
 
 def merge_tracks_to_frame_entries(
-    tracks: list[tuple[int | None, np.ndarray, np.ndarray]],
+    tracks: list[TrackData],
 ) -> list[list[tuple[int | None, np.ndarray]]]:
     """Convert per-track boxes into a per-frame representation."""
     max_frame = int(max(np.max(frames) for _, frames, _ in tracks))
@@ -168,7 +191,7 @@ def array_boxes_to_frame_entries(box_array: np.ndarray) -> list[list[tuple[int |
     raise ValueError(f"Unexpected bounding box shape: {box_array.shape}")
 
 
-def extract_people_tracks(people: Any) -> list[tuple[int | None, np.ndarray, np.ndarray]]:
+def extract_people_tracks(people: Any) -> list[TrackData]:
     """Extract tracked people from PromptHMR-style `results.pkl` content."""
     if isinstance(people, dict):
         people_items = list(people.items())
@@ -177,7 +200,7 @@ def extract_people_tracks(people: Any) -> list[tuple[int | None, np.ndarray, np.
     else:
         raise TypeError(f"Unknown `people` format: {type(people)}")
 
-    tracks: list[tuple[int | None, np.ndarray, np.ndarray]] = []
+    tracks: list[TrackData] = []
     for default_track_id, person in people_items:
         if not isinstance(person, dict) or "frames" not in person:
             continue
@@ -272,6 +295,95 @@ def extract_bbx_reference_size(bounding_boxes: Any) -> tuple[int, int] | None:
     return reference_width, reference_height
 
 
+def unpack_box_coordinates(box: np.ndarray) -> tuple[float, float, float, float]:
+    """Return a box as four float coordinates."""
+    box = box.astype(float)
+    if box.shape == (2, 2):
+        x1, y1 = box[0]
+        x2, y2 = box[1]
+    elif box.shape == (4,):
+        x1, y1, x2, y2 = box
+    else:
+        raise ValueError(f"Unexpected box shape for coordinate extraction: {box.shape}")
+
+    if x2 <= x1 or y2 <= y1:
+        x2 = x1 + max(0.0, x2)
+        y2 = y1 + max(0.0, y2)
+
+    return float(x1), float(y1), float(x2), float(y2)
+
+
+def normalize_box_coordinates(
+    box: np.ndarray,
+    reference_width: int | None = None,
+    reference_height: int | None = None,
+) -> tuple[float, float, float, float]:
+    """Normalize box coordinates so they are comparable across videos."""
+    x1, y1, x2, y2 = unpack_box_coordinates(box)
+    if all(0.0 <= value <= 1.5 for value in (x1, y1, x2, y2)):
+        return x1, y1, x2, y2
+
+    if reference_width is not None and reference_height is not None:
+        return (
+            x1 / float(reference_width),
+            y1 / float(reference_height),
+            x2 / float(reference_width),
+            y2 / float(reference_height),
+        )
+
+    return x1, y1, x2, y2
+
+
+def compute_box_center(
+    box: np.ndarray,
+    reference_width: int | None = None,
+    reference_height: int | None = None,
+) -> np.ndarray:
+    """Compute the center point of a bounding box."""
+    x1, y1, x2, y2 = normalize_box_coordinates(box, reference_width, reference_height)
+    return np.array(((x1 + x2) / 2.0, (y1 + y2) / 2.0), dtype=float)
+
+
+def extract_subject_boundaries(bounding_boxes: Any) -> dict[int | None, SubjectBoundary]:
+    """Extract start and end centers for each subject in one video segment."""
+    reference_size = extract_bbx_reference_size(bounding_boxes)
+    reference_width, reference_height = reference_size if reference_size is not None else (None, None)
+
+    if isinstance(bounding_boxes, dict) and "people" in bounding_boxes:
+        subject_boundaries: dict[int | None, SubjectBoundary] = {}
+        for track_id, frames, boxes in extract_people_tracks(bounding_boxes["people"]):
+            if frames.size == 0 or boxes.shape[0] == 0:
+                continue
+            subject_boundaries[track_id] = SubjectBoundary(
+                first_center=compute_box_center(boxes[0], reference_width, reference_height),
+                last_center=compute_box_center(boxes[-1], reference_width, reference_height),
+            )
+        if subject_boundaries:
+            return subject_boundaries
+
+    boxes_by_frame = extract_bbx_frame_entries(bounding_boxes)
+    first_frame_boxes = next((frame_boxes for frame_boxes in boxes_by_frame if frame_boxes), [])
+    last_frame_boxes = next((frame_boxes for frame_boxes in reversed(boxes_by_frame) if frame_boxes), [])
+    if not first_frame_boxes or not last_frame_boxes:
+        return {}
+
+    last_boxes_by_track = {
+        track_id if track_id is not None else fallback_index: box
+        for fallback_index, (track_id, box) in enumerate(last_frame_boxes, start=1)
+    }
+
+    subject_boundaries: dict[int | None, SubjectBoundary] = {}
+    for fallback_index, (track_id, box) in enumerate(first_frame_boxes, start=1):
+        subject_id = track_id if track_id is not None else fallback_index
+        last_box = last_boxes_by_track.get(subject_id, box)
+        subject_boundaries[subject_id] = SubjectBoundary(
+            first_center=compute_box_center(box, reference_width, reference_height),
+            last_center=compute_box_center(last_box, reference_width, reference_height),
+        )
+
+    return subject_boundaries
+
+
 def box_to_xyxy(
     box: np.ndarray,
     width: int,
@@ -280,14 +392,7 @@ def box_to_xyxy(
     reference_height: int | None = None,
 ) -> tuple[int, int, int, int]:
     """Convert a box representation into pixel-based `(x1, y1, x2, y2)` coordinates."""
-    box = box.astype(float)
-    if box.shape == (2, 2):
-        x1, y1 = box[0]
-        x2, y2 = box[1]
-    elif box.shape == (4,):
-        x1, y1, x2, y2 = box
-    else:
-        raise ValueError(f"Unexpected box shape for xyxy conversion: {box.shape}")
+    x1, y1, x2, y2 = unpack_box_coordinates(box)
 
     if all(0.0 <= value <= 1.5 for value in (x1, y1, x2, y2)):
         x1 *= width
@@ -305,10 +410,6 @@ def box_to_xyxy(
         x2 *= scale_x
         y1 *= scale_y
         y2 *= scale_y
-
-    if x2 <= x1 or y2 <= y1:
-        x2 = x1 + max(0.0, x2)
-        y2 = y1 + max(0.0, y2)
 
     x1_int = max(0, min(int(round(x1)), width - 1))
     y1_int = max(0, min(int(round(y1)), height - 1))
@@ -329,11 +430,119 @@ def is_jumping_frame(frame_index: int, jump_ranges: np.ndarray | None) -> bool:
     return False
 
 
+def solve_min_cost_assignment(cost_matrix: np.ndarray) -> list[tuple[int, int]]:
+    """Solve a one-to-one minimum-cost assignment for a dense cost matrix."""
+    if cost_matrix.size == 0:
+        return []
+
+    row_count, column_count = cost_matrix.shape
+    transposed = False
+    if row_count > column_count:
+        cost_matrix = cost_matrix.T
+        row_count, column_count = cost_matrix.shape
+        transposed = True
+
+    @lru_cache(maxsize=None)
+    def solve(row_index: int, used_mask: int) -> tuple[float, tuple[tuple[int, int], ...]]:
+        if row_index == row_count:
+            return 0.0, ()
+
+        best_cost = float("inf")
+        best_pairs: tuple[tuple[int, int], ...] = ()
+        for column_index in range(column_count):
+            if used_mask & (1 << column_index):
+                continue
+
+            remaining_cost, remaining_pairs = solve(row_index + 1, used_mask | (1 << column_index))
+            total_cost = float(cost_matrix[row_index, column_index]) + remaining_cost
+            if total_cost < best_cost:
+                best_cost = total_cost
+                best_pairs = ((row_index, column_index),) + remaining_pairs
+
+        return best_cost, best_pairs
+
+    _, assignment = solve(0, 0)
+    if transposed:
+        return [(column_index, row_index) for row_index, column_index in assignment]
+    return list(assignment)
+
+
+def map_subjects_across_segments(
+    segments: list[VideoSegment],
+) -> dict[Path, dict[int | None, int]]:
+    """Assign stable global subject IDs across all video segments."""
+    next_global_subject_id = 1
+    remembered_subject_centers: dict[int, np.ndarray] = {}
+    mappings_by_segment: dict[Path, dict[int | None, int]] = {}
+
+    for segment in segments:
+        local_subject_ids = sorted(
+            segment.subject_boundaries,
+            key=lambda subject_id: (-1 if subject_id is None else int(subject_id)),
+        )
+        if not local_subject_ids:
+            mappings_by_segment[segment.base_dir] = {}
+            continue
+
+        current_centers = np.array(
+            [segment.subject_boundaries[subject_id].first_center for subject_id in local_subject_ids],
+            dtype=float,
+        )
+        known_global_ids = sorted(remembered_subject_centers)
+        local_to_global: dict[int | None, int] = {}
+
+        if known_global_ids:
+            remembered_centers = np.array(
+                [remembered_subject_centers[global_id] for global_id in known_global_ids],
+                dtype=float,
+            )
+            cost_matrix = np.linalg.norm(
+                current_centers[:, np.newaxis, :] - remembered_centers[np.newaxis, :, :],
+                axis=2,
+            )
+            for local_index, global_index in solve_min_cost_assignment(cost_matrix):
+                local_to_global[local_subject_ids[local_index]] = known_global_ids[global_index]
+
+        for local_subject_id in local_subject_ids:
+            if local_subject_id in local_to_global:
+                continue
+            local_to_global[local_subject_id] = next_global_subject_id
+            next_global_subject_id += 1
+
+        mappings_by_segment[segment.base_dir] = local_to_global
+        for local_subject_id, global_subject_id in local_to_global.items():
+            remembered_subject_centers[global_subject_id] = segment.subject_boundaries[
+                local_subject_id
+            ].last_center
+
+    return mappings_by_segment
+
+
+def resolve_subject_id(
+    local_subject_id: int | None,
+    subject_id_mapping: dict[int | None, int] | None,
+    fallback_subject_id: int | None = None,
+) -> int | None:
+    """Resolve a local subject ID to its global subject ID."""
+    if subject_id_mapping is None:
+        return local_subject_id if local_subject_id is not None else fallback_subject_id
+
+    global_subject_id = subject_id_mapping.get(local_subject_id)
+    if global_subject_id is not None:
+        return global_subject_id
+
+    if local_subject_id is None and len(subject_id_mapping) == 1:
+        return next(iter(subject_id_mapping.values()))
+
+    return local_subject_id if local_subject_id is not None else fallback_subject_id
+
+
 def add_bbx(
     video_path: Path,
     bbx_obj: Any,
     out_path: Path,
     jump_ranges_by_subject: dict[int | None, np.ndarray],
+    subject_id_mapping: dict[int | None, int] | None = None,
 ) -> None:
     """Render subject bounding boxes and jump labels into a video."""
     boxes_by_frame = extract_bbx_frame_entries(bbx_obj)
@@ -366,10 +575,17 @@ def add_bbx(
         if frame_index < len(boxes_by_frame):
             frame_boxes = boxes_by_frame[frame_index]
             for fallback_subject_index, (track_id, box) in enumerate(frame_boxes, start=1):
-                subject_id = track_id if track_id is not None else fallback_subject_index
+                local_subject_id = track_id if track_id is not None else fallback_subject_index
+                subject_id = resolve_subject_id(
+                    local_subject_id,
+                    subject_id_mapping,
+                    fallback_subject_index,
+                )
                 jump_ranges = jump_ranges_by_subject.get(subject_id)
 
-                if jump_ranges is None and track_id is None and len(frame_boxes) == 1:
+                if jump_ranges is None and subject_id_mapping is not None and None in subject_id_mapping:
+                    jump_ranges = jump_ranges_by_subject.get(subject_id_mapping[None])
+                elif jump_ranges is None and track_id is None and len(frame_boxes) == 1:
                     jump_ranges = jump_ranges_by_subject.get(None)
 
                 is_jumping_subject = is_jumping_frame(frame_index, jump_ranges)
@@ -415,6 +631,47 @@ def add_bbx(
         frame_index += 1
 
     capture.release()
+    writer.release()
+
+
+def concatenate_videos(video_paths: list[Path], out_path: Path) -> None:
+    """Concatenate multiple videos into one output video in the given order."""
+    if not video_paths:
+        raise ValueError("No videos provided for concatenation.")
+
+    first_capture = cv2.VideoCapture(str(video_paths[0]))
+    if not first_capture.isOpened():
+        first_capture.release()
+        raise FileNotFoundError(f"Could not open video for concatenation: {video_paths[0]}")
+
+    output_fps = first_capture.get(cv2.CAP_PROP_FPS) or float(get_fps())
+    output_width = int(first_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    output_height = int(first_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    first_capture.release()
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(str(out_path), fourcc, output_fps, (output_width, output_height))
+
+    for video_path in video_paths:
+        capture = cv2.VideoCapture(str(video_path))
+        if not capture.isOpened():
+            capture.release()
+            writer.release()
+            raise FileNotFoundError(f"Could not open video for concatenation: {video_path}")
+
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+
+            if frame.shape[1] != output_width or frame.shape[0] != output_height:
+                frame = cv2.resize(frame, (output_width, output_height), interpolation=cv2.INTER_LINEAR)
+
+            writer.write(frame)
+
+        capture.release()
+
     writer.release()
 
 
@@ -532,6 +789,53 @@ def collect_input_files(folder: Path) -> dict[Path, list[Path]]:
     return grouped_files
 
 
+def collect_video_segments(folder: Path) -> list[VideoSegment]:
+    """Collect all processable video segments for a folder."""
+    input_files_by_dir = collect_input_files(folder)
+    segments: list[VideoSegment] = []
+
+    for base_dir, base_input_files in sorted(input_files_by_dir.items()):
+        has_bbx = any(base_dir.rglob("bbx.pt")) or any(base_dir.rglob("results.pkl"))
+        has_video = any(base_dir.rglob("*.mp4"))
+
+        if not has_bbx:
+            print(f"No bounding boxes found in {base_dir}")
+            continue
+        if not has_video:
+            print(f"No video found in {base_dir}")
+            continue
+
+        bbx_obj, video_path = load_bbx_and_video(base_dir)
+        segments.append(
+            VideoSegment(
+                base_dir=base_dir,
+                input_files=sorted(base_input_files),
+                bbx_obj=bbx_obj,
+                video_path=video_path,
+                subject_boundaries=extract_subject_boundaries(bbx_obj),
+            )
+        )
+
+    return segments
+
+
+def validate_segment_videos(segments: list[VideoSegment]) -> None:
+    """Ensure every segment video can be opened before tracking starts."""
+    for segment in segments:
+        capture = cv2.VideoCapture(str(segment.video_path))
+        if not capture.isOpened():
+            capture.release()
+            raise FileNotFoundError(f"Could not open video: {segment.video_path}")
+        capture.release()
+
+
+def parse_subject_id_from_file(input_file: Path) -> int | None:
+    """Extract the local subject ID from a file name."""
+    if input_file.stem.startswith("subject-"):
+        return int(input_file.stem.removeprefix("subject-"))
+    return None
+
+
 def process_subject_file(input_file: Path, out_dir: Path) -> tuple[int | None, np.ndarray]:
     """Process one subject file and return its inferred jump ranges."""
     hmr_output = load_input_file(input_file)
@@ -539,49 +843,66 @@ def process_subject_file(input_file: Path, out_dir: Path) -> tuple[int | None, n
     y_smooth = smooth_1d(transl[:, 1], window=11)
     y_peaks, jump_ranges = find_peaks_1d(y_smooth)
 
-    subject_id = None
-    if input_file.stem.startswith("subject-"):
-        subject_id = int(input_file.stem.removeprefix("subject-"))
-
     plot_path = out_dir / f"{input_file.stem}.png"
     plot_transl(transl, y_smooth, y_peaks, title=input_file.name, save_path=plot_path)
-    return subject_id, jump_ranges
+    return parse_subject_id_from_file(input_file), jump_ranges
 
 
-def main(i: str = "") -> None:
+def main(input_video: str = "") -> None:
     """Run the jump detection visualization pipeline for the selected input folder."""
     inputs_root = Path("inputs")
-    folder = inputs_root if i == "" else inputs_root / i
+    folder = inputs_root if input_video == "" else inputs_root / input_video
 
     if not folder.exists():
         raise FileNotFoundError(f"Input folder not found: {folder}")
     if not folder.is_dir():
         raise NotADirectoryError(f"Input path is not a directory: {folder}")
 
-    output_root = Path("outputs")
-    input_files_by_dir = collect_input_files(folder)
+    output_root = Path("outputs") / "input_video"
+    segments = collect_video_segments(folder)
+    validate_segment_videos(segments)
+    subject_mappings = map_subjects_across_segments(segments)
 
-    for base_dir, base_input_files in sorted(input_files_by_dir.items()):
-        has_bbx = any(base_dir.rglob("bbx.pt")) or any(base_dir.rglob("results.pkl"))
-        has_video = any(base_dir.rglob("*.mp4"))
+    jump_ranges_by_segment: dict[Path, dict[int | None, np.ndarray]] = {}
+    rendered_video_paths: list[Path] = []
 
-        if has_bbx and has_video:
-            bbx_obj, video_path = load_bbx_and_video(base_dir)
-            relative_dir = base_dir.relative_to(folder)
-            out_dir = output_root / relative_dir
-            jump_ranges_by_subject: dict[int | None, np.ndarray] = {}
+    # Phase 1: track jumps for all segments first.
+    for segment in segments:
+        relative_dir = segment.base_dir.relative_to(folder)
+        out_dir = output_root / relative_dir
+        subject_mapping = subject_mappings.get(segment.base_dir, {})
+        jump_ranges_by_subject: dict[int | None, np.ndarray] = {}
 
-            for input_file in sorted(base_input_files):
-                subject_id, jump_ranges = process_subject_file(input_file, out_dir)
-                jump_ranges_by_subject[subject_id] = jump_ranges
+        for input_file in segment.input_files:
+            local_subject_id, jump_ranges = process_subject_file(input_file, out_dir)
+            global_subject_id = resolve_subject_id(local_subject_id, subject_mapping)
+            if global_subject_id is None:
+                continue
+            jump_ranges_by_subject[global_subject_id] = jump_ranges
 
-            video_file = out_dir / "all_subjects.mp4"
-            add_bbx(video_path, bbx_obj, video_file, jump_ranges_by_subject)
-            print(f"Finished {base_dir}")
-        elif has_bbx:
-            print(f"No video found in {base_dir}")
-        else:
-            print(f"No bounding boxes found in {base_dir}")
+        jump_ranges_by_segment[segment.base_dir] = jump_ranges_by_subject
+
+    # Phase 2: render processed videos with BBX matching.
+    for segment in segments:
+        relative_dir = segment.base_dir.relative_to(folder)
+        out_dir = output_root / relative_dir
+        subject_mapping = subject_mappings.get(segment.base_dir, {})
+        jump_ranges_by_subject = jump_ranges_by_segment.get(segment.base_dir, {})
+
+        video_file = out_dir / "all_subjects.mp4"
+        add_bbx(
+            segment.video_path,
+            segment.bbx_obj,
+            video_file,
+            jump_ranges_by_subject,
+            subject_id_mapping=subject_mapping,
+        )
+        rendered_video_paths.append(video_file)
+        print(f"Finished {segment.base_dir}")
+
+    merged_video_file = output_root / "all_subjects_merged.mp4"
+    concatenate_videos(rendered_video_paths, merged_video_file)
+    print(f"Created merged video: {merged_video_file}")
 
 
 if __name__ == "__main__":

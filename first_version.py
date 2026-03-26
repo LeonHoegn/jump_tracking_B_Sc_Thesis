@@ -13,6 +13,7 @@ import torch
 import tyro
 
 DEFAULT_THRESHOLD = 0.2
+DEFAULT_JUMP_FACTOR_THRESHOLD = 0.8
 DEFAULT_FPS = 30
 DEFAULT_CONTROL_TIME = 0.2
 BOX_KEYS = ("bboxes", "bbx", "bbox", "boxes")
@@ -40,9 +41,29 @@ class VideoSegment:
     subject_boundaries: dict[int | None, SubjectBoundary]
 
 
+@dataclass(frozen=True)
+class SubjectMotionData:
+    """Translation data for one processed subject file."""
+
+    transl: np.ndarray
+
+
+@dataclass(frozen=True)
+class SubjectSegmentMotion:
+    """One tracked subject segment within the global subject timeline."""
+
+    base_dir: Path
+    input_file: Path
+    transl: np.ndarray
+
+
 def get_threshold() -> float:
     """Return the minimum jump amplitude threshold."""
     return DEFAULT_THRESHOLD
+
+def get_jump_factor_threshold() -> float:
+    """Return the minimum jump amplitude factor threshold."""
+    return DEFAULT_JUMP_FACTOR_THRESHOLD
 
 
 def get_fps() -> int:
@@ -703,6 +724,7 @@ def plot_transl(
     y_peaks: np.ndarray,
     title: str,
     save_path: Path | None = None,
+    segment_boundaries: list[int] | None = None,
 ) -> None:
     """Plot raw and smoothed translation curves and optionally save the figure."""
     plt.figure()
@@ -711,6 +733,9 @@ def plot_transl(
     if y_peaks.size >= 1:
         plt.scatter(y_peaks, y_smooth[y_peaks], color="red", s=20, zorder=3, label="y peaks")
     plt.plot(transl[:, 2], label="z")
+    if segment_boundaries is not None:
+        for boundary in segment_boundaries:
+            plt.axvline(boundary, color="gray", linestyle="--", linewidth=1, alpha=0.5)
     plt.xlabel("Frame")
     plt.ylabel("Translation")
     plt.title(title)
@@ -727,6 +752,7 @@ def plot_transl(
 
 
 def smooth_1d(values: np.ndarray, window: int = 11) -> np.ndarray:
+    return values
     """Apply edge-padded moving-average smoothing to a 1D signal."""
     if window <= 1:
         return values
@@ -759,6 +785,7 @@ def find_peaks_1d(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     surrounding_low_points: list[int] = []
     mean_value = float(np.mean(values))
     threshold = get_threshold()
+    jump_factor_threshold = get_jump_factor_threshold()
 
     for high_point in high_points:
         right_index = int(np.searchsorted(low_points, high_point, side="right"))
@@ -770,7 +797,7 @@ def find_peaks_1d(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         right_low = int(low_points[right_index])
         amplitude = values[high_point] - values[left_low]
 
-        if amplitude >= threshold and mean_value < values[high_point] + (0.8 * threshold):
+        if amplitude >= threshold and mean_value < values[high_point] + (jump_factor_threshold * threshold):
             qualifying_high_points.append(int(high_point))
             surrounding_low_points.extend((left_low, right_low))
 
@@ -836,16 +863,104 @@ def parse_subject_id_from_file(input_file: Path) -> int | None:
     return None
 
 
-def process_subject_file(input_file: Path, out_dir: Path) -> tuple[int | None, np.ndarray]:
-    """Process one subject file and return its inferred jump ranges."""
+def process_subject_file(input_file: Path) -> tuple[int | None, SubjectMotionData]:
+    """Process one subject file and return its translation data."""
     hmr_output = load_input_file(input_file)
     transl = extract_transl(hmr_output)
-    y_smooth = smooth_1d(transl[:, 1], window=11)
-    y_peaks, jump_ranges = find_peaks_1d(y_smooth)
+    return parse_subject_id_from_file(input_file), SubjectMotionData(transl=transl)
 
-    plot_path = out_dir / f"{input_file.stem}.png"
-    plot_transl(transl, y_smooth, y_peaks, title=input_file.name, save_path=plot_path)
-    return parse_subject_id_from_file(input_file), jump_ranges
+
+def concatenate_subject_segments(
+    subject_segments: list[SubjectSegmentMotion],
+) -> tuple[np.ndarray, list[int]]:
+    """Concatenate subject segments while removing artificial y-offset jumps."""
+    if not subject_segments:
+        return np.empty((0, 3), dtype=float), []
+
+    adjusted_segments: list[np.ndarray] = []
+    segment_boundaries: list[int] = []
+    cumulative_length = 0
+    previous_last_y: float | None = None
+
+    for index, segment in enumerate(subject_segments):
+        adjusted_transl = segment.transl.astype(float, copy=True)
+        if adjusted_transl.size == 0:
+            continue
+
+        if previous_last_y is not None:
+            y_offset = previous_last_y - float(adjusted_transl[0, 1])
+            adjusted_transl[:, 1] += y_offset
+
+        adjusted_segments.append(adjusted_transl)
+        cumulative_length += adjusted_transl.shape[0]
+        if index < len(subject_segments) - 1:
+            segment_boundaries.append(cumulative_length)
+        previous_last_y = float(adjusted_transl[-1, 1])
+
+    if not adjusted_segments:
+        return np.empty((0, 3), dtype=float), []
+
+    return np.concatenate(adjusted_segments, axis=0), segment_boundaries
+
+
+def plot_subject_motion_across_segments(
+    subject_id: int,
+    subject_segments: list[SubjectSegmentMotion],
+    jump_ranges: np.ndarray,
+    save_path: Path,
+) -> None:
+    """Plot concatenated xyz motion for one tracked subject across all segments."""
+    if not subject_segments:
+        return
+
+    concatenated_transl, segment_boundaries = concatenate_subject_segments(subject_segments)
+    y_smooth = smooth_1d(concatenated_transl[:, 1], window=11)
+    y_peaks = jump_ranges[0::2] + ((jump_ranges[1::2] - jump_ranges[0::2]) // 2)
+
+    title_parts: list[str] = []
+    for segment in subject_segments:
+        title_parts.append(segment.input_file.parent.name)
+
+    unique_title_parts = list(dict.fromkeys(title_parts))
+    plot_transl(
+        concatenated_transl,
+        y_smooth,
+        y_peaks,
+        title=f"subject-{subject_id}: {' | '.join(unique_title_parts)}",
+        save_path=save_path,
+        segment_boundaries=segment_boundaries,
+    )
+
+
+def detect_jumps_for_concatenated_subject(
+    subject_segments: list[SubjectSegmentMotion],
+) -> tuple[np.ndarray, dict[Path, np.ndarray]]:
+    """Run jump detection on the full subject timeline and split ranges back per segment."""
+    if not subject_segments:
+        empty = np.array([], dtype=int)
+        return empty, {}
+
+    concatenated_transl, _ = concatenate_subject_segments(subject_segments)
+    y_smooth = smooth_1d(concatenated_transl[:, 1], window=11)
+    _, global_jump_ranges = find_peaks_1d(y_smooth)
+
+    jump_ranges_by_segment: dict[Path, list[int]] = {}
+    segment_start = 0
+    for segment in subject_segments:
+        segment_end = segment_start + segment.transl.shape[0]
+        segment_jump_ranges: list[int] = []
+
+        for global_start, global_end in zip(global_jump_ranges[0::2], global_jump_ranges[1::2]):
+            overlap_start = max(int(global_start), segment_start)
+            overlap_end = min(int(global_end), segment_end)
+            if overlap_start >= overlap_end:
+                continue
+            segment_jump_ranges.extend((overlap_start - segment_start, overlap_end - segment_start))
+
+        jump_ranges_by_segment[segment.base_dir] = np.array(segment_jump_ranges, dtype=int)
+        segment_start = segment_end
+
+    return global_jump_ranges, jump_ranges_by_segment
 
 
 def main(input_video: str = "") -> None:
@@ -858,29 +973,45 @@ def main(input_video: str = "") -> None:
     if not folder.is_dir():
         raise NotADirectoryError(f"Input path is not a directory: {folder}")
 
-    output_root = Path("outputs") / "input_video"
+    output_root = Path("outputs") / input_video
     segments = collect_video_segments(folder)
     validate_segment_videos(segments)
     subject_mappings = map_subjects_across_segments(segments)
 
     jump_ranges_by_segment: dict[Path, dict[int | None, np.ndarray]] = {}
+    transl_by_subject: dict[int, list[SubjectSegmentMotion]] = {}
     rendered_video_paths: list[Path] = []
 
-    # Phase 1: track jumps for all segments first.
+    # Phase 1: collect motion for all segments first.
     for segment in segments:
-        relative_dir = segment.base_dir.relative_to(folder)
-        out_dir = output_root / relative_dir
         subject_mapping = subject_mappings.get(segment.base_dir, {})
-        jump_ranges_by_subject: dict[int | None, np.ndarray] = {}
+        jump_ranges_by_segment.setdefault(segment.base_dir, {})
 
         for input_file in segment.input_files:
-            local_subject_id, jump_ranges = process_subject_file(input_file, out_dir)
+            local_subject_id, subject_motion = process_subject_file(input_file)
             global_subject_id = resolve_subject_id(local_subject_id, subject_mapping)
             if global_subject_id is None:
                 continue
-            jump_ranges_by_subject[global_subject_id] = jump_ranges
+            transl_by_subject.setdefault(global_subject_id, []).append(
+                SubjectSegmentMotion(
+                    base_dir=segment.base_dir,
+                    input_file=input_file,
+                    transl=subject_motion.transl,
+                )
+            )
 
-        jump_ranges_by_segment[segment.base_dir] = jump_ranges_by_subject
+    subject_plot_dir = output_root / "subjects"
+    for subject_id, subject_segments in sorted(transl_by_subject.items()):
+        global_jump_ranges, split_jump_ranges = detect_jumps_for_concatenated_subject(subject_segments)
+        for base_dir, subject_jump_ranges in split_jump_ranges.items():
+            jump_ranges_by_segment.setdefault(base_dir, {})[subject_id] = subject_jump_ranges
+
+        plot_subject_motion_across_segments(
+            subject_id,
+            subject_segments,
+            global_jump_ranges,
+            subject_plot_dir / f"subject-{subject_id}.png",
+        )
 
     # Phase 2: render processed videos with BBX matching.
     for segment in segments:

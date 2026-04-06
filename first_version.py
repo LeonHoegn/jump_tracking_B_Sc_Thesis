@@ -16,6 +16,7 @@ DEFAULT_THRESHOLD = 0.2
 DEFAULT_JUMP_FACTOR_THRESHOLD = 0.8
 DEFAULT_FPS = 30
 DEFAULT_CONTROL_TIME = 0.2
+OVERLAP_FRAMES = 5
 BOX_KEYS = ("bboxes", "bbx", "bbox", "boxes")
 TRANSLATION_KEYS = ("transl", "translation", "root_transl", "root_translation")
 
@@ -23,11 +24,11 @@ TrackData = tuple[int | None, np.ndarray, np.ndarray]
 
 
 @dataclass(frozen=True)
-class SubjectBoundary:
-    """Representative subject positions at the start and end of a video segment."""
+class SubjectOverlap:
+    """Subject centers over the overlap frames at the start and end of a segment."""
 
-    first_center: np.ndarray
-    last_center: np.ndarray
+    start_centers: np.ndarray
+    end_centers: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -38,7 +39,7 @@ class VideoSegment:
     input_files: list[Path]
     bbx_obj: Any
     video_path: Path
-    subject_boundaries: dict[int | None, SubjectBoundary]
+    subject_overlaps: dict[int | None, SubjectOverlap]
 
 
 @dataclass(frozen=True)
@@ -365,44 +366,81 @@ def compute_box_center(
     return np.array(((x1 + x2) / 2.0, (y1 + y2) / 2.0), dtype=float)
 
 
-def extract_subject_boundaries(bounding_boxes: Any) -> dict[int | None, SubjectBoundary]:
-    """Extract start and end centers for each subject in one video segment."""
+def compute_centers_for_boxes(
+    boxes: np.ndarray,
+    reference_width: int | None = None,
+    reference_height: int | None = None,
+) -> np.ndarray:
+    """Convert a sequence of boxes into normalized center coordinates."""
+    return np.array(
+        [compute_box_center(box, reference_width, reference_height) for box in boxes],
+        dtype=float,
+    )
+
+
+def extract_subject_overlaps(bounding_boxes: Any) -> dict[int | None, SubjectOverlap]:
+    """Extract overlap-frame center sequences for each subject in one segment."""
     reference_size = extract_bbx_reference_size(bounding_boxes)
     reference_width, reference_height = reference_size if reference_size is not None else (None, None)
 
     if isinstance(bounding_boxes, dict) and "people" in bounding_boxes:
-        subject_boundaries: dict[int | None, SubjectBoundary] = {}
+        subject_overlaps: dict[int | None, SubjectOverlap] = {}
         for track_id, frames, boxes in extract_people_tracks(bounding_boxes["people"]):
             if frames.size == 0 or boxes.shape[0] == 0:
                 continue
-            subject_boundaries[track_id] = SubjectBoundary(
-                first_center=compute_box_center(boxes[0], reference_width, reference_height),
-                last_center=compute_box_center(boxes[-1], reference_width, reference_height),
+            overlap_count = min(OVERLAP_FRAMES, boxes.shape[0])
+            subject_overlaps[track_id] = SubjectOverlap(
+                start_centers=compute_centers_for_boxes(
+                    boxes[:overlap_count],
+                    reference_width,
+                    reference_height,
+                ),
+                end_centers=compute_centers_for_boxes(
+                    boxes[-overlap_count:],
+                    reference_width,
+                    reference_height,
+                ),
             )
-        if subject_boundaries:
-            return subject_boundaries
+        if subject_overlaps:
+            return subject_overlaps
 
     boxes_by_frame = extract_bbx_frame_entries(bounding_boxes)
-    first_frame_boxes = next((frame_boxes for frame_boxes in boxes_by_frame if frame_boxes), [])
-    last_frame_boxes = next((frame_boxes for frame_boxes in reversed(boxes_by_frame) if frame_boxes), [])
-    if not first_frame_boxes or not last_frame_boxes:
+    non_empty_frames = [frame_boxes for frame_boxes in boxes_by_frame if frame_boxes]
+    if not non_empty_frames:
         return {}
 
-    last_boxes_by_track = {
-        track_id if track_id is not None else fallback_index: box
-        for fallback_index, (track_id, box) in enumerate(last_frame_boxes, start=1)
-    }
+    start_frames = non_empty_frames[:OVERLAP_FRAMES]
+    end_frames = non_empty_frames[-OVERLAP_FRAMES:]
 
-    subject_boundaries: dict[int | None, SubjectBoundary] = {}
-    for fallback_index, (track_id, box) in enumerate(first_frame_boxes, start=1):
-        subject_id = track_id if track_id is not None else fallback_index
-        last_box = last_boxes_by_track.get(subject_id, box)
-        subject_boundaries[subject_id] = SubjectBoundary(
-            first_center=compute_box_center(box, reference_width, reference_height),
-            last_center=compute_box_center(last_box, reference_width, reference_height),
+    start_centers_by_subject: dict[int | None, list[np.ndarray]] = {}
+    for frame_boxes in start_frames:
+        for fallback_index, (track_id, box) in enumerate(frame_boxes, start=1):
+            subject_id = track_id if track_id is not None else fallback_index
+            start_centers_by_subject.setdefault(subject_id, []).append(
+                compute_box_center(box, reference_width, reference_height)
+            )
+
+    end_centers_by_subject: dict[int | None, list[np.ndarray]] = {}
+    for frame_boxes in end_frames:
+        for fallback_index, (track_id, box) in enumerate(frame_boxes, start=1):
+            subject_id = track_id if track_id is not None else fallback_index
+            end_centers_by_subject.setdefault(subject_id, []).append(
+                compute_box_center(box, reference_width, reference_height)
+            )
+
+    subject_ids = sorted(set(start_centers_by_subject) | set(end_centers_by_subject), key=str)
+    subject_overlaps: dict[int | None, SubjectOverlap] = {}
+    for subject_id in subject_ids:
+        start_centers = start_centers_by_subject.get(subject_id)
+        end_centers = end_centers_by_subject.get(subject_id)
+        if not start_centers or not end_centers:
+            continue
+        subject_overlaps[subject_id] = SubjectOverlap(
+            start_centers=np.array(start_centers, dtype=float),
+            end_centers=np.array(end_centers, dtype=float),
         )
 
-    return subject_boundaries
+    return subject_overlaps
 
 
 def box_to_xyxy(
@@ -488,40 +526,56 @@ def solve_min_cost_assignment(cost_matrix: np.ndarray) -> list[tuple[int, int]]:
     return list(assignment)
 
 
+def compute_overlap_cost(current_overlap: SubjectOverlap, previous_overlap: SubjectOverlap) -> float:
+    """Compare two subjects over their overlap-frame center sequences."""
+    overlap_count = min(current_overlap.start_centers.shape[0], previous_overlap.end_centers.shape[0])
+    if overlap_count == 0:
+        return float("inf")
+
+    current_centers = current_overlap.start_centers[:overlap_count]
+    previous_centers = previous_overlap.end_centers[-overlap_count:]
+    distances = np.linalg.norm(current_centers - previous_centers, axis=1)
+    return float(np.mean(distances))
+
+
 def map_subjects_across_segments(
     segments: list[VideoSegment],
 ) -> dict[Path, dict[int | None, int]]:
-    """Assign stable global subject IDs across all video segments."""
+    """Assign stable global subject IDs using overlap frames between adjacent segments."""
     next_global_subject_id = 1
-    remembered_subject_centers: dict[int, np.ndarray] = {}
+    previous_segment_overlaps: dict[int, SubjectOverlap] = {}
     mappings_by_segment: dict[Path, dict[int | None, int]] = {}
 
     for segment in segments:
         local_subject_ids = sorted(
-            segment.subject_boundaries,
+            segment.subject_overlaps,
             key=lambda subject_id: (-1 if subject_id is None else int(subject_id)),
         )
         if not local_subject_ids:
             mappings_by_segment[segment.base_dir] = {}
+            previous_segment_overlaps = {}
             continue
 
-        current_centers = np.array(
-            [segment.subject_boundaries[subject_id].first_center for subject_id in local_subject_ids],
-            dtype=float,
-        )
-        known_global_ids = sorted(remembered_subject_centers)
         local_to_global: dict[int | None, int] = {}
+        known_global_ids = sorted(previous_segment_overlaps)
 
         if known_global_ids:
-            remembered_centers = np.array(
-                [remembered_subject_centers[global_id] for global_id in known_global_ids],
+            cost_matrix = np.array(
+                [
+                    [
+                        compute_overlap_cost(
+                            segment.subject_overlaps[local_subject_id],
+                            previous_segment_overlaps[global_subject_id],
+                        )
+                        for global_subject_id in known_global_ids
+                    ]
+                    for local_subject_id in local_subject_ids
+                ],
                 dtype=float,
             )
-            cost_matrix = np.linalg.norm(
-                current_centers[:, np.newaxis, :] - remembered_centers[np.newaxis, :, :],
-                axis=2,
-            )
             for local_index, global_index in solve_min_cost_assignment(cost_matrix):
+                if not np.isfinite(cost_matrix[local_index, global_index]):
+                    continue
                 local_to_global[local_subject_ids[local_index]] = known_global_ids[global_index]
 
         for local_subject_id in local_subject_ids:
@@ -531,10 +585,10 @@ def map_subjects_across_segments(
             next_global_subject_id += 1
 
         mappings_by_segment[segment.base_dir] = local_to_global
-        for local_subject_id, global_subject_id in local_to_global.items():
-            remembered_subject_centers[global_subject_id] = segment.subject_boundaries[
-                local_subject_id
-            ].last_center
+        previous_segment_overlaps = {
+            global_subject_id: segment.subject_overlaps[local_subject_id]
+            for local_subject_id, global_subject_id in local_to_global.items()
+        }
 
     return mappings_by_segment
 
@@ -839,7 +893,7 @@ def collect_video_segments(folder: Path) -> list[VideoSegment]:
                 input_files=sorted(base_input_files),
                 bbx_obj=bbx_obj,
                 video_path=video_path,
-                subject_boundaries=extract_subject_boundaries(bbx_obj),
+                subject_overlaps=extract_subject_overlaps(bbx_obj),
             )
         )
 
